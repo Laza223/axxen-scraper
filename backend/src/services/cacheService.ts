@@ -8,7 +8,7 @@ export const API_PRICES = {
   placeDetails: 17.0 / 1000, // $17 per 1000
 };
 
-class CacheService {
+export class CacheService {
   private redis: Redis | null = null;
   private memoryCache: Map<string, { data: any; expires: number }> = new Map();
   private isRedisAvailable = false;
