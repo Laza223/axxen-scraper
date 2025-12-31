@@ -1,0 +1,112 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Lead {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Business Info
+  businessName String
+  category     String
+  categoryEs   String? // Categoría traducida
+  address      String
+  latitude     Float
+  longitude    Float
+  placeId      String  @unique
+
+  // Contact
+  phoneRaw      String?
+  phoneWhatsapp String?
+  emails        String[] // Emails encontrados en el sitio
+  
+  // Google Data
+  googleRating   Float?
+  reviewCount    Int     @default(0)
+  priceLevel     Int? // 0-4
+  isOpen         Boolean @default(true)
+  businessHours  Json?
+  googleMapsUrl  String?
+
+  // Website Analysis
+  hasWebsite       Boolean  @default(false)
+  websiteUrl       String?
+  websiteStatus    String?  @default("none") // none, parked, generic, active, error
+  websiteLoadTime  Int? // ms
+  websiteIssues    String[]
+  hasContactForm   Boolean  @default(false)
+  hasWhatsAppWidget Boolean @default(false)
+  hasLiveChat      Boolean  @default(false)
+  hasSslCertificate Boolean @default(false)
+  isMobileResponsive Boolean @default(false)
+
+  // Social Media
+  facebookUrl   String?
+  instagramUrl  String?
+  linkedinUrl   String?
+  twitterUrl    String?
+  youtubeUrl    String?
+  tiktokUrl     String?
+
+  // Scoring & Analysis
+  leadScore        Int      @default(0) // 0-100
+  estimatedRevenue String   @default("Medium") // Low/Medium/High
+  painPoints       String[]
+  opportunities    String[] // Oportunidades de venta
+  techStack        String?  // Stack tecnológico detectado
+
+  // Competition Analysis
+  nearbyCompetitors    Int @default(0)
+  competitorsWithWeb   Int @default(0)
+  competitorAvgRating  Float?
+
+  // Tracking
+  outreachStatus String @default("new") // new, contacted, responded, meeting, proposal, closed, lost
+  lastContactAt  DateTime?
+  notes          String?
+  tags           String[]
+
+  // Search Metadata
+  searchKeyword  String
+  searchLocation String
+
+  @@index([leadScore(sort: Desc)])
+  @@index([outreachStatus])
+  @@index([searchKeyword, searchLocation])
+  @@index([createdAt(sort: Desc)])
+  @@index([hasWebsite])
+  @@index([googleRating(sort: Desc)])
+}
+
+model SearchHistory {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  
+  keyword       String
+  location      String
+  radius        Int
+  resultsFound  Int
+  leadsCreated  Int
+  apiCost       Float? // Costo estimado en USD
+  duration      Int? // ms
+  
+  @@index([createdAt(sort: Desc)])
+}
+
+model ApiUsage {
+  id        String   @id @default(cuid())
+  date      DateTime @default(now()) @db.Date
+  
+  geocodingCalls    Int @default(0)
+  nearbySearchCalls Int @default(0)
+  placeDetailsCalls Int @default(0)
+  estimatedCost     Float @default(0)
+  
+  @@unique([date])
+}
