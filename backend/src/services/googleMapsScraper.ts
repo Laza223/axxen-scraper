@@ -1,6 +1,13 @@
 import puppeteer, { Browser, Page } from "puppeteer";
 import antiDetection from "./antiDetection";
 import cacheService from "./cacheService";
+import {
+  buildGridSearchUrl,
+  calculateBoundingBox,
+  createGrid,
+  extractCoordsFromUrl,
+  generateGridConfig,
+} from "./gridSearchService";
 import logger from "./logger";
 import { googleMapsCircuitBreaker, withRetry } from "./retryService";
 import scraperMetrics from "./scraperMetrics";
@@ -9,9 +16,10 @@ import scraperMetrics from "./scraperMetrics";
 const CONFIG = {
   HEADLESS: true, // true = sin ventana, false = ver el navegador
   TIMEOUT: 30000,
-  MAX_SCROLL_ATTEMPTS: 12, // Aumentado para más resultados
+  MAX_SCROLL_ATTEMPTS: 20, // Más intentos para zonas con muchos resultados
   MAX_CONCURRENT_TABS: 3, // Tabs paralelas para detalles
   RETRY_ATTEMPTS: 3,
+  ENABLE_GRID_SEARCH: true, // Habilitar búsqueda por grilla para cubrir toda el área
   // Delays ahora son dinámicos desde antiDetection
 };
 
@@ -57,6 +65,36 @@ const CATEGORY_SYNONYMS: Record<string, string[]> = {
     "pizzería",
     "cafetería",
     "bar",
+    "resto",
+    "bodegón",
+    "cervecería",
+    "grill",
+    "asador",
+    "sushi",
+    "hamburguesería",
+    "pizza",
+    "empanadas",
+  ],
+  restaurantes: [
+    "restaurante",
+    "restaurant",
+    "comida",
+    "food",
+    "cocina",
+    "gastronomía",
+    "parrilla",
+    "pizzería",
+    "cafetería",
+    "bar",
+    "resto",
+    "bodegón",
+    "cervecería",
+    "grill",
+    "asador",
+    "sushi",
+    "hamburguesería",
+    "pizza",
+    "empanadas",
   ],
   dentista: [
     "dentista",
@@ -91,6 +129,26 @@ const CATEGORY_SYNONYMS: Record<string, string[]> = {
     "crossfit",
     "entrenamiento",
     "training",
+    "musculación",
+    "pilates",
+    "spinning",
+    "funcional",
+    "deportivo",
+    "club",
+  ],
+  gimnasios: [
+    "gimnasio",
+    "gym",
+    "fitness",
+    "crossfit",
+    "entrenamiento",
+    "training",
+    "musculación",
+    "pilates",
+    "spinning",
+    "funcional",
+    "deportivo",
+    "club",
   ],
   inmobiliaria: [
     "inmobiliaria",
@@ -170,6 +228,7 @@ export interface ScrapeOptions {
   discoverEmails?: boolean; // Activar email discovery
   concurrentTabs?: number; // Tabs paralelas
   strictMatch?: boolean; // Solo resultados con coincidencia exacta (sin categorías relacionadas)
+  forceRefresh?: boolean; // Ignorar caché y hacer scraping nuevo
 }
 
 export interface ScrapeStats {
@@ -282,6 +341,43 @@ class GoogleMapsScraper {
       }
     }
 
+    // Buscar cualquier sinónimo de cualquier categoría en reversa
+    // (si la categoría contiene algo de nuestro keyword)
+    if (score === 0) {
+      for (const [key, syns] of Object.entries(CATEGORY_SYNONYMS)) {
+        const normalizedKey = key
+          .toLowerCase()
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "");
+        // Si el keyword está relacionado con esta categoría
+        if (
+          normalizedKeyword.includes(normalizedKey) ||
+          normalizedKey.includes(normalizedKeyword)
+        ) {
+          for (const syn of syns) {
+            const normalizedSyn = syn
+              .toLowerCase()
+              .normalize("NFD")
+              .replace(/[\u0300-\u036f]/g, "");
+            if (
+              normalizedCategory.includes(normalizedSyn) ||
+              normalizedName.includes(normalizedSyn)
+            ) {
+              score += 50;
+              break;
+            }
+          }
+          if (score > 0) break;
+        }
+      }
+    }
+
+    // Si aún no hay score, dar un score base mínimo de 20 para no filtrar todo
+    // Los resultados vienen de Google Maps para esa búsqueda, así que tienen algo de relevancia
+    if (score === 0) {
+      score = 20;
+    }
+
     // Penalizar categorías excluidas
     for (const excluded of EXCLUDED_CATEGORIES) {
       if (normalizedCategory.includes(excluded)) {
@@ -349,10 +445,16 @@ class GoogleMapsScraper {
   }
 
   /**
-   * Scrapear lugares de Google Maps con mejoras avanzadas
+   * Scrapear lugares de Google Maps con búsqueda por grilla dinámica
+   * Cubre toda el área de la ciudad, no solo el centro
    */
   async scrapePlaces(options: ScrapeOptions): Promise<ScrapedPlace[]> {
-    const { keyword, location, maxResults = 40 } = options;
+    const {
+      keyword,
+      location,
+      maxResults = 40,
+      forceRefresh = false,
+    } = options;
     const cacheKey = `scrape:${keyword}:${location}`.toLowerCase();
     const startTime = Date.now();
 
@@ -367,12 +469,20 @@ class GoogleMapsScraper {
       );
     }
 
-    // Verificar caché
-    const cached = await cacheService.get<ScrapedPlace[]>(cacheKey);
-    if (cached) {
-      logger.info(`📦 Resultados desde caché: ${cached.length} lugares`);
-      scraperMetrics.recordCacheHit();
-      return cached;
+    // Si forceRefresh, limpiar caché para esta búsqueda
+    if (forceRefresh) {
+      await cacheService.delete(cacheKey);
+      logger.info(`🔄 [FORCE REFRESH] Caché limpiado para: ${cacheKey}`);
+    }
+
+    // Verificar caché (solo si no es forceRefresh)
+    if (!forceRefresh) {
+      const cached = await cacheService.get<ScrapedPlace[]>(cacheKey);
+      if (cached) {
+        logger.info(`📦 Resultados desde caché: ${cached.length} lugares`);
+        scraperMetrics.recordCacheHit();
+        return cached;
+      }
     }
     scraperMetrics.recordCacheMiss();
 
@@ -380,7 +490,8 @@ class GoogleMapsScraper {
     if (!this.browser) throw new Error("No se pudo iniciar el navegador");
 
     const page = await this.browser.newPage();
-    const places: ScrapedPlace[] = [];
+    const allPlaces: ScrapedPlace[] = [];
+    const seenPlaceIds = new Set<string>();
 
     try {
       // Configuración anti-detección
@@ -406,112 +517,176 @@ class GoogleMapsScraper {
         });
       });
 
-      // Construir URL de búsqueda
+      // PASO 1: Búsqueda inicial para obtener coordenadas del centro
       const searchQuery = encodeURIComponent(`${keyword} en ${location}`);
-      const url = `https://www.google.com/maps/search/${searchQuery}`;
+      const initialUrl = `https://www.google.com/maps/search/${searchQuery}`;
 
-      logger.info(`🔍 Navegando a: ${url}`);
+      logger.info(`🔍 [1/2] Búsqueda inicial: ${initialUrl}`);
 
-      // Navegar con reintentos
       await withRetry(
         async () => {
-          await page.goto(url, {
+          await page.goto(initialUrl, {
             waitUntil: "networkidle2",
             timeout: CONFIG.TIMEOUT,
           });
         },
         { maxRetries: CONFIG.RETRY_ATTEMPTS },
-        "Navegación a Google Maps"
+        "Navegación inicial a Google Maps"
       );
 
-      // Delay humanizado
       await this.humanSleep();
-
-      // Aceptar cookies si aparece el popup
       await this.acceptCookies(page);
 
-      // Esperar el panel de resultados
-      await page
-        .waitForSelector('div[role="feed"]', { timeout: 10000 })
-        .catch(() => {
-          logger.warn("⚠️ No se encontró el panel de resultados");
-        });
+      // Esperar a que se cargue y obtener coordenadas de la URL
+      await this.sleep(2000);
+      const currentUrl = page.url();
+      const centerCoords = extractCoordsFromUrl(currentUrl);
 
-      // Scroll para cargar más resultados
-      const scrolledPlaces = await this.scrollAndCollect(page, maxResults);
+      if (!centerCoords) {
+        logger.warn(
+          "⚠️ No se pudieron extraer coordenadas, usando búsqueda simple"
+        );
+        // Fallback a búsqueda simple si no hay coordenadas
+        return this.scrapeSimple(
+          page,
+          options,
+          allPlaces,
+          seenPlaceIds,
+          startTime,
+          cacheKey
+        );
+      }
 
       logger.info(
-        `📍 Encontrados ${scrolledPlaces.length} lugares, obteniendo detalles...`
+        `📍 Centro detectado: ${centerCoords.lat.toFixed(
+          4
+        )}, ${centerCoords.lng.toFixed(4)}`
       );
 
-      // Obtener detalles de cada lugar (con delays humanizados)
-      for (let i = 0; i < Math.min(scrolledPlaces.length, maxResults); i++) {
-        try {
-          const placeUrl = scrolledPlaces[i];
-          const requestStart = Date.now();
+      // PASO 2: Generar grilla de búsqueda dinámica
+      const gridConfig = generateGridConfig(location);
+      logger.info(
+        `🗺️ Generando grilla ${gridConfig.gridSize}x${gridConfig.gridSize} (radio: ${gridConfig.radiusKm}km)`
+      );
 
-          const details = await this.getPlaceDetails(
+      const bbox = calculateBoundingBox(centerCoords, gridConfig.radiusKm);
+      const gridCells = createGrid(bbox, gridConfig.gridSize);
+
+      logger.info(
+        `🔍 [2/2] Buscando en ${gridCells.length} celdas de la grilla...`
+      );
+
+      // Buscar en cada celda de la grilla
+      for (
+        let i = 0;
+        i < gridCells.length && allPlaces.length < maxResults;
+        i++
+      ) {
+        const cell = gridCells[i];
+        const cellUrl = buildGridSearchUrl(keyword, cell);
+
+        logger.info(
+          `📍 [${i + 1}/${gridCells.length}] Celda ${cell.label} - zoom ${
+            cell.zoom
+          }`
+        );
+
+        try {
+          await page.goto(cellUrl, {
+            waitUntil: "networkidle2",
+            timeout: CONFIG.TIMEOUT,
+          });
+
+          await this.humanSleep(1000, 2000);
+
+          // Esperar el panel de resultados
+          await page
+            .waitForSelector('div[role="feed"]', { timeout: 8000 })
+            .catch(() => {});
+
+          // Scroll y recolectar
+          const cellMaxResults =
+            Math.ceil(
+              (maxResults - allPlaces.length) / (gridCells.length - i)
+            ) + 5;
+          const scrolledPlaces = await this.scrollAndCollect(
             page,
-            placeUrl,
-            i + 1,
-            scrolledPlaces.length
+            cellMaxResults
           );
 
-          const requestDuration = Date.now() - requestStart;
+          logger.debug(
+            `   ↳ Encontrados ${scrolledPlaces.length} lugares en celda ${cell.label}`
+          );
 
-          if (details) {
-            places.push(details);
+          // Obtener detalles de cada lugar nuevo
+          for (const placeUrl of scrolledPlaces) {
+            if (allPlaces.length >= maxResults) break;
 
-            // Registrar métricas
-            scraperMetrics.recordRequest({
-              url: placeUrl,
-              success: true,
-              duration: requestDuration,
-            });
+            // Extraer placeId de la URL para evitar duplicados
+            const placeIdMatch = placeUrl.match(/!1s([^!]+)/);
+            const placeId = placeIdMatch ? placeIdMatch[1] : placeUrl;
 
-            scraperMetrics.recordPlaceFound({
-              phone: details.phone,
-              website: details.website,
-              socialMediaUrl: details.socialMediaUrl,
-              relevanceScore: details.relevanceScore,
-            });
+            if (seenPlaceIds.has(placeId)) {
+              continue;
+            }
+            seenPlaceIds.add(placeId);
+
+            try {
+              const details = await this.getPlaceDetails(
+                page,
+                placeUrl,
+                allPlaces.length + 1,
+                maxResults
+              );
+
+              if (details) {
+                allPlaces.push(details);
+                scraperMetrics.recordRequest({
+                  url: placeUrl,
+                  success: true,
+                  duration: 0,
+                });
+                scraperMetrics.recordPlaceFound({
+                  phone: details.phone,
+                  website: details.website,
+                  socialMediaUrl: details.socialMediaUrl,
+                  relevanceScore: details.relevanceScore,
+                });
+              }
+
+              await this.humanSleep(300, 800);
+            } catch (error: any) {
+              logger.warn(`⚠️ Error en lugar: ${error.message}`);
+            }
           }
 
-          // Delay humanizado entre lugares
-          await this.humanSleep(300, 800);
-
-          // Pausas largas ocasionales (simular humano)
-          if (antiDetection.shouldTakeLongPause()) {
-            logger.debug("☕ Tomando pausa larga (comportamiento humano)");
-            await this.sleep(antiDetection.getLongPauseDelay());
+          // Delay entre celdas
+          if (i < gridCells.length - 1) {
+            await this.humanSleep(1500, 2500);
           }
         } catch (error: any) {
-          logger.warn(`⚠️ Error en lugar ${i + 1}: ${error.message}`);
-          scraperMetrics.recordRequest({
-            url: scrolledPlaces[i],
-            success: false,
-            duration: 0,
-            error: error.message,
-          });
+          logger.warn(`⚠️ Error en celda ${cell.label}: ${error.message}`);
         }
       }
 
       // Guardar en caché (1 día)
-      if (places.length > 0) {
-        await cacheService.set(cacheKey, places, 86400);
+      if (allPlaces.length > 0) {
+        await cacheService.set(cacheKey, allPlaces, 86400);
         googleMapsCircuitBreaker.recordSuccess();
       }
 
       // Filtrar por relevancia si strictMatch está activado
-      let filteredPlaces = places;
+      let filteredPlaces = allPlaces;
       if (options.strictMatch) {
-        const minRelevance = 60; // Mínimo score para considerarlo relevante
-        filteredPlaces = places.filter((p) => p.relevanceScore >= minRelevance);
+        const minRelevance = 60;
+        filteredPlaces = allPlaces.filter(
+          (p) => p.relevanceScore >= minRelevance
+        );
 
-        if (filteredPlaces.length < places.length) {
+        if (filteredPlaces.length < allPlaces.length) {
           logger.info(
             `🎯 Modo estricto: ${
-              places.length - filteredPlaces.length
+              allPlaces.length - filteredPlaces.length
             } resultados filtrados por baja relevancia`
           );
         }
@@ -519,9 +694,9 @@ class GoogleMapsScraper {
 
       const totalDuration = Date.now() - startTime;
       logger.info(
-        `✅ Scraping completado: ${filteredPlaces.length} lugares en ${(
-          totalDuration / 1000
-        ).toFixed(1)}s`
+        `✅ Scraping por grilla completado: ${
+          filteredPlaces.length
+        } lugares en ${(totalDuration / 1000).toFixed(1)}s`
       );
       scraperMetrics.logDetailedSummary();
 
@@ -533,6 +708,120 @@ class GoogleMapsScraper {
     } finally {
       await page.close();
     }
+  }
+
+  /**
+   * Scraping simple (fallback cuando no hay coordenadas)
+   */
+  private async scrapeSimple(
+    page: Page,
+    options: ScrapeOptions,
+    places: ScrapedPlace[],
+    seenPlaceIds: Set<string>,
+    startTime: number,
+    cacheKey: string
+  ): Promise<ScrapedPlace[]> {
+    const { maxResults = 40 } = options;
+
+    // Esperar el panel de resultados
+    await page
+      .waitForSelector('div[role="feed"]', { timeout: 10000 })
+      .catch(() => {
+        logger.warn("⚠️ No se encontró el panel de resultados");
+      });
+
+    // Scroll para cargar más resultados
+    const scrolledPlaces = await this.scrollAndCollect(page, maxResults);
+
+    logger.info(
+      `📍 Encontrados ${scrolledPlaces.length} lugares, obteniendo detalles...`
+    );
+
+    // Obtener detalles de cada lugar
+    for (let i = 0; i < Math.min(scrolledPlaces.length, maxResults); i++) {
+      try {
+        const placeUrl = scrolledPlaces[i];
+        const requestStart = Date.now();
+
+        const details = await this.getPlaceDetails(
+          page,
+          placeUrl,
+          i + 1,
+          scrolledPlaces.length
+        );
+
+        const requestDuration = Date.now() - requestStart;
+
+        if (details) {
+          places.push(details);
+          scraperMetrics.recordRequest({
+            url: placeUrl,
+            success: true,
+            duration: requestDuration,
+          });
+          scraperMetrics.recordPlaceFound({
+            phone: details.phone,
+            website: details.website,
+            socialMediaUrl: details.socialMediaUrl,
+            relevanceScore: details.relevanceScore,
+          });
+        }
+
+        await this.humanSleep(300, 800);
+
+        if (antiDetection.shouldTakeLongPause()) {
+          logger.debug("☕ Tomando pausa larga (comportamiento humano)");
+          await this.sleep(antiDetection.getLongPauseDelay());
+        }
+      } catch (error: any) {
+        logger.warn(`⚠️ Error en lugar ${i + 1}: ${error.message}`);
+        scraperMetrics.recordRequest({
+          url: scrolledPlaces[i],
+          success: false,
+          duration: 0,
+          error: error.message,
+        });
+      }
+    }
+
+    // Guardar en caché
+    if (places.length > 0) {
+      await cacheService.set(cacheKey, places, 86400);
+      googleMapsCircuitBreaker.recordSuccess();
+    }
+
+    // Filtrar por relevancia si strictMatch
+    let filteredPlaces = places;
+    if (options.strictMatch) {
+      const minRelevance = 60;
+      filteredPlaces = places.filter((p) => p.relevanceScore >= minRelevance);
+
+      if (filteredPlaces.length < places.length) {
+        logger.info(
+          `🎯 Modo estricto: ${
+            places.length - filteredPlaces.length
+          } resultados filtrados`
+        );
+      }
+    }
+
+    const totalDuration = Date.now() - startTime;
+    logger.info(
+      `✅ Scraping simple completado: ${filteredPlaces.length} lugares en ${(
+        totalDuration / 1000
+      ).toFixed(1)}s`
+    );
+    scraperMetrics.logDetailedSummary();
+
+    return filteredPlaces;
+  }
+
+  /**
+   * Construir URL de búsqueda (legacy - para compatibilidad)
+   */
+  private buildSearchUrl(keyword: string, location: string): string {
+    const searchQuery = encodeURIComponent(`${keyword} en ${location}`);
+    return `https://www.google.com/maps/search/${searchQuery}`;
   }
 
   /**
@@ -573,6 +862,11 @@ class GoogleMapsScraper {
     const placeUrls: Set<string> = new Set();
     let scrollAttempts = 0;
     let lastCount = 0;
+    let noNewResultsCount = 0;
+
+    logger.info(
+      `📜 Iniciando scroll para encontrar hasta ${maxResults} lugares...`
+    );
 
     while (
       scrollAttempts < CONFIG.MAX_SCROLL_ATTEMPTS &&
@@ -594,8 +888,18 @@ class GoogleMapsScraper {
       urls.forEach((url) => placeUrls.add(url));
 
       if (placeUrls.size === lastCount) {
+        noNewResultsCount++;
         scrollAttempts++;
+
+        // Si después de 3 intentos sin nuevos resultados, probablemente llegamos al final
+        if (noNewResultsCount >= 3) {
+          logger.info(
+            `📜 Fin de resultados alcanzado después de ${scrollAttempts} scrolls (${placeUrls.size} lugares)`
+          );
+          break;
+        }
       } else {
+        noNewResultsCount = 0;
         scrollAttempts = 0;
         lastCount = placeUrls.size;
       }
@@ -617,6 +921,9 @@ class GoogleMapsScraper {
       );
     }
 
+    logger.info(
+      `📜 Scroll completado: ${placeUrls.size} lugares únicos encontrados`
+    );
     return Array.from(placeUrls).slice(0, maxResults);
   }
 

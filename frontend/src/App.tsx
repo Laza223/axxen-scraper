@@ -651,9 +651,13 @@ export default function App() {
   // 🆕 Modal states
   const [searchModalOpen, setSearchModalOpen] = useState(false);
   const [exportModalOpen, setExportModalOpen] = useState(false);
+  const [alertsModalOpen, setAlertsModalOpen] = useState(false); // 🆕 Modal de alertas premium
 
   // 🆕 Premium alerts
   const [premiumAlerts, setPremiumAlerts] = useState<PremiumAlert[]>([]);
+
+  // 🆕 Estado de carga para botón Actualizar
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   // Estado de scraping en tiempo real
   const [scrapeStatus, setScrapeStatus] = useState<{
@@ -664,12 +668,23 @@ export default function App() {
     maxResults: number;
   } | null>(null);
 
-  // Última búsqueda (para "Volver a scrapear")
+  // Última búsqueda (para "Volver a scrapear") - persistida en localStorage
   const [lastSearch, setLastSearch] = useState<{
     keyword: string;
     location: string;
     maxResults: number;
-  } | null>(null);
+  } | null>(() => {
+    // Cargar desde localStorage al iniciar
+    const saved = localStorage.getItem("lastSearch");
+    if (saved) {
+      try {
+        return JSON.parse(saved);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  });
 
   // Paginación
   const [pagination, setPagination] = useState<Pagination>({
@@ -784,6 +799,20 @@ export default function App() {
     }
   };
 
+  // 🆕 Función de refresh con feedback visual
+  const handleRefresh = async () => {
+    setIsRefreshing(true);
+    try {
+      await loadLeads();
+      await loadStats();
+      addToast("✓ Lista actualizada", "success");
+    } catch {
+      addToast("Error al actualizar", "error");
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
   // Cambiar página
   const goToPage = (page: number) => {
     setPagination((prev) => ({ ...prev, page }));
@@ -812,19 +841,23 @@ export default function App() {
     searchKeyword: string,
     searchLocation: string,
     searchMaxResults: number = 30,
-    strictMatch: boolean = false // 🆕 Modo estricto
+    strictMatch: boolean = false,
+    forceRefresh: boolean = false, // 🆕 Forzar re-scraping sin caché
+    excludeExisting: boolean = true // 🆕 Excluir leads existentes
   ) => {
     if (!searchKeyword || !searchLocation) {
       setError("Completa keyword y ubicación");
       return;
     }
 
-    // Guardar última búsqueda
-    setLastSearch({
+    // Guardar última búsqueda (también en localStorage para persistencia)
+    const searchData = {
       keyword: searchKeyword,
       location: searchLocation,
       maxResults: searchMaxResults,
-    });
+    };
+    setLastSearch(searchData);
+    localStorage.setItem("lastSearch", JSON.stringify(searchData));
 
     setError("");
     setLoading(true);
@@ -845,7 +878,9 @@ export default function App() {
         keyword: searchKeyword,
         location: searchLocation,
         maxResults: searchMaxResults.toString(),
-        strictMatch: strictMatch.toString(), // 🆕 Pasar modo estricto
+        strictMatch: strictMatch.toString(),
+        forceRefresh: forceRefresh.toString(), // 🆕
+        excludeExisting: excludeExisting.toString(), // 🆕
       });
 
       const eventSource = new EventSource(`${API_URL}/scrape/stream?${params}`);
@@ -908,6 +943,18 @@ export default function App() {
                 }
               : null
           );
+        });
+
+        // 🆕 Listener para cuando empiezan a llegar leads existentes
+        eventSource.addEventListener("existing_leads_start", (e) => {
+          const data = JSON.parse(e.data);
+          addToast(`📥 Cargando ${data.count} leads existentes...`, "info");
+        });
+
+        // 🆕 Listener para cuando terminan de llegar leads existentes
+        eventSource.addEventListener("existing_leads_complete", (e) => {
+          const data = JSON.parse(e.data);
+          addToast(`✅ ${data.count} leads existentes cargados`, "success");
         });
 
         eventSource.addEventListener("zone_complete", (e) => {
@@ -984,13 +1031,18 @@ export default function App() {
 
   /**
    * Volver a scrapear con los valores anteriores
+   * - forceRefresh=true: ignora el caché y hace scraping nuevo
+   * - excludeExisting=false: envía también los leads que ya existen en DB
    */
   const handleRescrape = () => {
     if (lastSearch) {
       handleScrape(
         lastSearch.keyword,
         lastSearch.location,
-        lastSearch.maxResults
+        lastSearch.maxResults,
+        false, // strictMatch
+        true, // forceRefresh - buscar de nuevo sin caché
+        false // excludeExisting - incluir leads existentes
       );
     }
   };
@@ -1142,6 +1194,114 @@ export default function App() {
         }}
       />
 
+      {/* Modal de Alertas Premium */}
+      {alertsModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div
+            className="absolute inset-0 bg-black/70 backdrop-blur-sm"
+            onClick={() => setAlertsModalOpen(false)}
+          />
+          <div className="relative bg-zinc-900 border border-amber-700/50 rounded-2xl shadow-2xl w-full max-w-lg mx-4 overflow-hidden max-h-[80vh]">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-800 bg-gradient-to-r from-amber-900/30 to-orange-900/30">
+              <div className="flex items-center gap-3">
+                <div className="bg-gradient-to-br from-amber-500 to-orange-600 p-2 rounded-lg">
+                  <Bell className="w-5 h-5 text-white" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-semibold text-amber-100">
+                    Leads Premium
+                  </h2>
+                  <p className="text-xs text-amber-300/70">
+                    {premiumAlerts.length} oportunidades detectadas
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setAlertsModalOpen(false)}
+                className="p-2 hover:bg-zinc-800 rounded-lg transition-colors"
+              >
+                <X className="w-5 h-5 text-zinc-400" />
+              </button>
+            </div>
+            <div className="p-4 space-y-3 overflow-y-auto max-h-[60vh]">
+              {premiumAlerts.length === 0 ? (
+                <p className="text-center text-zinc-500 py-8">
+                  No hay alertas premium aún
+                </p>
+              ) : (
+                premiumAlerts.map((alert, idx) => (
+                  <div
+                    key={idx}
+                    className={`p-4 rounded-lg border ${
+                      alert.priority === "high"
+                        ? "bg-green-900/20 border-green-700/50"
+                        : alert.priority === "medium"
+                        ? "bg-amber-900/20 border-amber-700/50"
+                        : "bg-zinc-800/50 border-zinc-700/50"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between mb-2">
+                      <h3 className="font-semibold text-zinc-100">
+                        {alert.businessName}
+                      </h3>
+                      <span
+                        className={`px-2 py-0.5 rounded text-xs font-medium ${
+                          alert.priority === "high"
+                            ? "bg-green-600 text-white"
+                            : alert.priority === "medium"
+                            ? "bg-amber-600 text-white"
+                            : "bg-zinc-600 text-zinc-200"
+                        }`}
+                      >
+                        {alert.priority === "high"
+                          ? "🔥 Alta"
+                          : alert.priority === "medium"
+                          ? "⭐ Media"
+                          : "Baja"}
+                      </span>
+                    </div>
+                    <p className="text-sm text-amber-300 mb-2">
+                      Score: {alert.score} pts
+                    </p>
+                    <ul className="text-xs text-zinc-400 space-y-1 mb-3">
+                      {alert.reasons.map((reason, i) => (
+                        <li key={i}>• {reason}</li>
+                      ))}
+                    </ul>
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-emerald-400">
+                        {alert.suggestedAction}
+                      </span>
+                      <span className="text-zinc-500">
+                        {alert.estimatedValue}
+                      </span>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+            <div className="px-6 py-4 border-t border-zinc-800 flex justify-between">
+              <button
+                onClick={() => {
+                  setPremiumAlerts([]);
+                  setAlertsModalOpen(false);
+                  addToast("Alertas limpiadas", "info");
+                }}
+                className="px-4 py-2 text-sm text-zinc-400 hover:text-zinc-200"
+              >
+                Limpiar todas
+              </button>
+              <button
+                onClick={() => setAlertsModalOpen(false)}
+                className="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded-lg text-sm font-medium"
+              >
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Header simplificado */}
       <header className="bg-zinc-900 border-b border-zinc-800 sticky top-0 z-50">
         <div className="max-w-[1800px] mx-auto px-4 py-3">
@@ -1198,10 +1358,14 @@ export default function App() {
               {/* Badge de alertas premium */}
               {premiumAlerts.length > 0 && (
                 <div className="relative">
-                  <button className="p-2.5 bg-amber-600/20 border border-amber-500/30 rounded-lg text-amber-400 hover:bg-amber-600/30 transition-colors">
+                  <button
+                    onClick={() => setAlertsModalOpen(true)}
+                    className="p-2.5 bg-amber-600/20 border border-amber-500/30 rounded-lg text-amber-400 hover:bg-amber-600/30 transition-colors"
+                    title={`${premiumAlerts.length} leads premium encontrados`}
+                  >
                     <Bell className="w-4 h-4" />
                   </button>
-                  <span className="absolute -top-1 -right-1 w-5 h-5 bg-amber-500 text-zinc-900 text-xs font-bold rounded-full flex items-center justify-center">
+                  <span className="absolute -top-1 -right-1 w-5 h-5 bg-amber-500 text-zinc-900 text-xs font-bold rounded-full flex items-center justify-center animate-pulse">
                     {premiumAlerts.length}
                   </span>
                 </div>
@@ -1385,11 +1549,14 @@ export default function App() {
 
           {/* Refresh */}
           <button
-            onClick={loadLeads}
-            className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 rounded text-xs font-medium flex items-center gap-2"
+            onClick={handleRefresh}
+            disabled={isRefreshing}
+            className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 rounded text-xs font-medium flex items-center gap-2"
           >
-            <RefreshCw className="w-4 h-4" />
-            Actualizar
+            <RefreshCw
+              className={`w-4 h-4 ${isRefreshing ? "animate-spin" : ""}`}
+            />
+            {isRefreshing ? "Actualizando..." : "Actualizar"}
           </button>
 
           <span className="text-xs text-zinc-500">

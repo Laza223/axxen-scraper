@@ -195,7 +195,9 @@ app.get("/api/scrape/stream", async (req: Request, res: Response) => {
     const keyword = req.query.keyword as string;
     const location = req.query.location as string;
     const maxResults = parseInt(req.query.maxResults as string) || 30;
-    const strictMatch = req.query.strictMatch === "true"; // 🆕 Modo estricto
+    const strictMatch = req.query.strictMatch === "true";
+    const excludeExisting = req.query.excludeExisting !== "false"; // Por defecto true
+    const forceRefresh = req.query.forceRefresh === "true"; // 🆕 Forzar re-scraping
 
     if (!keyword || !location) {
       sendEvent("error", { message: "keyword y location son requeridos" });
@@ -206,9 +208,18 @@ app.get("/api/scrape/stream", async (req: Request, res: Response) => {
     logger.info(
       `🎯 [STREAM] Búsqueda: "${keyword}" en ${location}${
         strictMatch ? " (modo estricto)" : ""
+      }${excludeExisting ? "" : " (incluir existentes)"}${
+        forceRefresh ? " (FORCE REFRESH)" : ""
       }`
     );
-    sendEvent("start", { keyword, location, maxResults, strictMatch });
+    sendEvent("start", {
+      keyword,
+      location,
+      maxResults,
+      strictMatch,
+      excludeExisting,
+      forceRefresh,
+    });
 
     // Importar y usar el scraper directamente para tener control granular
     const googleMapsScraper = (await import("./services/googleMapsScraper"))
@@ -219,133 +230,197 @@ app.get("/api/scrape/stream", async (req: Request, res: Response) => {
     const zones = zoneAnalysis.subzones;
     const seenPlaceIds = new Set<string>();
     let totalFound = 0;
+    let skippedExisting = 0;
+    let existingSent = 0;
 
-    // Obtener placeIds existentes
-    const existingLeads = await prisma.lead.findMany({
+    // Obtener leads existentes con misma búsqueda
+    const existingLeadsForSearch = await prisma.lead.findMany({
+      where: {
+        searchKeyword: keyword,
+        searchLocation: location,
+      },
+    });
+
+    // Obtener TODOS los placeIds existentes (para evitar duplicados al guardar)
+    const allExistingLeads = await prisma.lead.findMany({
       select: { placeId: true },
     });
-    const existingPlaceIds = new Set(existingLeads.map((l) => l.placeId));
+    const existingPlaceIds = new Set(allExistingLeads.map((l) => l.placeId));
+
+    logger.info(
+      `📊 ${existingLeadsForSearch.length} leads ya existen para esta búsqueda | ${existingPlaceIds.size} total en DB`
+    );
+
+    // 🆕 Si NO excluimos existentes, enviarlos primero
+    if (!excludeExisting && existingLeadsForSearch.length > 0) {
+      logger.info(
+        `📤 Enviando ${existingLeadsForSearch.length} leads existentes primero...`
+      );
+      sendEvent("existing_leads_start", {
+        count: existingLeadsForSearch.length,
+      });
+
+      for (const lead of existingLeadsForSearch) {
+        seenPlaceIds.add(lead.placeId);
+        existingSent++;
+        sendEvent("lead", {
+          lead,
+          count: existingSent,
+          maxResults,
+          isExisting: true, // 🆕 Marcar como existente
+        });
+      }
+
+      sendEvent("existing_leads_complete", { count: existingSent });
+      totalFound = existingSent;
+    }
 
     sendEvent("zones", {
       isLargeZone: zoneAnalysis.isLargeZone,
       totalZones: zones.length,
       zones: zones,
+      existingCount: existingLeadsForSearch.length,
+      existingSent,
     });
 
-    // Scrapear cada zona
-    for (let i = 0; i < zones.length && totalFound < maxResults; i++) {
-      const zone = zones[i];
-      sendEvent("zone_start", { zone, index: i + 1, total: zones.length });
+    // Calcular cuántos resultados NUEVOS queremos buscar
+    // Si forceRefresh, buscar maxResults ADICIONALES a los existentes
+    const targetNewResults = forceRefresh
+      ? maxResults
+      : maxResults - existingSent;
+    let newFound = 0;
 
-      try {
-        const places = await googleMapsScraper.scrapePlaces({
-          keyword,
-          location: zone,
-          maxResults: Math.ceil(maxResults / zones.length) + 5,
-          strictMatch, // 🆕 Pasar modo estricto al scraper
-        });
+    // Scrapear cada zona (solo si queremos más resultados)
+    if (targetNewResults > 0) {
+      for (let i = 0; i < zones.length && newFound < targetNewResults; i++) {
+        const zone = zones[i];
+        sendEvent("zone_start", { zone, index: i + 1, total: zones.length });
 
-        for (const place of places) {
-          // Skip duplicados
-          if (
-            seenPlaceIds.has(place.placeId) ||
-            existingPlaceIds.has(place.placeId)
-          ) {
-            continue;
+        try {
+          const places = await googleMapsScraper.scrapePlaces({
+            keyword,
+            location: zone,
+            maxResults: Math.ceil(maxResults / zones.length) + 5,
+            strictMatch,
+            forceRefresh, // 🆕 Pasar forceRefresh al scraper
+          });
+
+          for (const place of places) {
+            // Skip duplicados en esta sesión
+            if (seenPlaceIds.has(place.placeId)) {
+              continue;
+            }
+
+            // Skip existentes solo si excludeExisting está activo
+            if (excludeExisting && existingPlaceIds.has(place.placeId)) {
+              logger.debug(`⏭️ Saltando lead existente: ${place.name}`);
+              skippedExisting++;
+              continue;
+            }
+            seenPlaceIds.add(place.placeId);
+
+            // Calcular leadScore
+            let leadScore = 0;
+            if (!place.hasRealWebsite) leadScore += 35;
+            if (place.socialMediaUrl) leadScore += 20;
+            if (place.rating && place.rating >= 4.0) leadScore += 15;
+            if (place.reviewCount >= 50) leadScore += 10;
+            if (place.phone) leadScore += 10;
+
+            // Guardar en DB
+            const savedLead = await prisma.lead.upsert({
+              where: { placeId: place.placeId },
+              update: {},
+              create: {
+                placeId: place.placeId,
+                businessName: place.name,
+                category: place.category || "Sin categoría",
+                address: place.address,
+                latitude: 0,
+                longitude: 0,
+                phoneRaw: place.phone,
+                websiteUrl: place.website,
+                googleMapsUrl: place.googleMapsUrl,
+                googleRating: place.rating,
+                reviewCount: place.reviewCount,
+                hasWebsite: place.hasRealWebsite,
+                instagramUrl: place.socialMediaUrl?.includes("instagram")
+                  ? place.socialMediaUrl
+                  : undefined,
+                facebookUrl: place.socialMediaUrl?.includes("facebook")
+                  ? place.socialMediaUrl
+                  : undefined,
+                leadScore,
+                searchKeyword: keyword,
+                searchLocation: location,
+                outreachStatus: "new",
+              },
+            });
+
+            newFound++;
+            totalFound++;
+            sendEvent("lead", {
+              lead: savedLead,
+              count: totalFound,
+              maxResults: existingSent + targetNewResults,
+              isNew: true, // 🆕 Marcar como nuevo
+            });
+
+            // Evaluar si es lead premium y enviar alerta
+            const premiumAlert = premiumAlertService.evaluateLead({
+              id: savedLead.id,
+              businessName: savedLead.businessName,
+              category: savedLead.category,
+              address: savedLead.address,
+              googleRating: savedLead.googleRating,
+              reviewCount: savedLead.reviewCount,
+              hasWebsite: savedLead.hasWebsite,
+              websiteUrl: savedLead.websiteUrl,
+              leadScore: savedLead.leadScore,
+              phoneRaw: savedLead.phoneRaw,
+              instagramUrl: savedLead.instagramUrl,
+              facebookUrl: savedLead.facebookUrl,
+            });
+
+            if (premiumAlert) {
+              sendEvent("premium_alert", premiumAlert);
+            }
+
+            if (newFound >= targetNewResults) break;
           }
-          seenPlaceIds.add(place.placeId);
 
-          // Calcular leadScore
-          let leadScore = 0;
-          if (!place.hasRealWebsite) leadScore += 35;
-          if (place.socialMediaUrl) leadScore += 20;
-          if (place.rating && place.rating >= 4.0) leadScore += 15;
-          if (place.reviewCount >= 50) leadScore += 10;
-          if (place.phone) leadScore += 10;
-
-          // Guardar en DB
-          const savedLead = await prisma.lead.upsert({
-            where: { placeId: place.placeId },
-            update: {},
-            create: {
-              placeId: place.placeId,
-              businessName: place.name,
-              category: place.category || "Sin categoría",
-              address: place.address,
-              latitude: 0,
-              longitude: 0,
-              phoneRaw: place.phone,
-              websiteUrl: place.website,
-              googleMapsUrl: place.googleMapsUrl,
-              googleRating: place.rating,
-              reviewCount: place.reviewCount,
-              hasWebsite: place.hasRealWebsite,
-              instagramUrl: place.socialMediaUrl?.includes("instagram")
-                ? place.socialMediaUrl
-                : undefined,
-              facebookUrl: place.socialMediaUrl?.includes("facebook")
-                ? place.socialMediaUrl
-                : undefined,
-              leadScore,
-              searchKeyword: keyword,
-              searchLocation: location,
-              outreachStatus: "new",
-            },
+          sendEvent("zone_complete", {
+            zone,
+            index: i + 1,
+            found: places.length,
+            totalFound,
+            newFound,
           });
 
-          totalFound++;
-          sendEvent("lead", {
-            lead: savedLead,
-            count: totalFound,
-            maxResults,
-          });
-
-          // Evaluar si es lead premium y enviar alerta
-          const premiumAlert = premiumAlertService.evaluateLead({
-            id: savedLead.id,
-            businessName: savedLead.businessName,
-            category: savedLead.category,
-            address: savedLead.address,
-            googleRating: savedLead.googleRating,
-            reviewCount: savedLead.reviewCount,
-            hasWebsite: savedLead.hasWebsite,
-            websiteUrl: savedLead.websiteUrl,
-            leadScore: savedLead.leadScore,
-            phoneRaw: savedLead.phoneRaw,
-            instagramUrl: savedLead.instagramUrl,
-            facebookUrl: savedLead.facebookUrl,
-          });
-
-          if (premiumAlert) {
-            sendEvent("premium_alert", premiumAlert);
+          // Delay entre zonas
+          if (i < zones.length - 1 && newFound < targetNewResults) {
+            await new Promise((r) => setTimeout(r, 1500));
           }
-
-          if (totalFound >= maxResults) break;
+        } catch (zoneError) {
+          sendEvent("zone_error", {
+            zone,
+            error: (zoneError as Error).message,
+          });
         }
-
-        sendEvent("zone_complete", {
-          zone,
-          index: i + 1,
-          found: places.length,
-          totalFound,
-        });
-
-        // Delay entre zonas
-        if (i < zones.length - 1 && totalFound < maxResults) {
-          await new Promise((r) => setTimeout(r, 1500));
-        }
-      } catch (zoneError) {
-        sendEvent("zone_error", {
-          zone,
-          error: (zoneError as Error).message,
-        });
       }
-    }
+    } // Cerrar el if (targetNewResults > 0)
 
     sendEvent("complete", {
       totalFound,
+      newLeads: newFound,
+      existingSent,
+      skippedExisting,
       duration: Date.now(),
     });
+
+    logger.info(
+      `✅ [STREAM] Completado: ${totalFound} total (${existingSent} existentes + ${newFound} nuevos), ${skippedExisting} duplicados saltados`
+    );
 
     res.end();
   } catch (error) {

@@ -658,6 +658,8 @@ class PlacesService {
             twitterUrl: lead.socialMedia?.twitter ?? null,
             linkedinUrl: lead.socialMedia?.linkedin ?? null,
             leadScore: lead.leadScore,
+            searchKeyword: keyword,
+            searchLocation: location,
             updatedAt: new Date(),
           },
           create: {

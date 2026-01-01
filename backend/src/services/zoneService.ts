@@ -258,48 +258,29 @@ export interface ZoneAnalysis {
 }
 
 /**
- * Analiza si una ubicación es una zona grande que se puede subdividir
- * NOTA: Solo subdivide si la ubicación ES la zona grande, no si la contiene
+ * Analiza una ubicación - SIMPLIFICADO
+ *
+ * El sistema de grilla dinámica del scraper ahora maneja la subdivisión
+ * de cualquier zona automáticamente, sin necesidad de hardcodear.
+ *
+ * Este método ahora solo sirve para mantener compatibilidad con el código existente.
+ * Siempre retorna la ubicación directa - el scraper se encarga de la grilla.
  */
 export function analyzeZone(location: string): ZoneAnalysis {
-  const normalized = location.toLowerCase().trim();
+  // El scraper ahora usa búsqueda por grilla dinámica
+  // que subdivide CUALQUIER ubicación automáticamente
+  logger.info(`📍 Ubicación: "${location}" (grilla dinámica activa)`);
 
-  for (const [zoneName, definition] of Object.entries(ZONE_MAP)) {
-    for (const alias of definition.aliases) {
-      // Solo match exacto o casi exacto (ignorando país al final)
-      // Ej: "Buenos Aires" o "Buenos Aires, Argentina" → match
-      // Pero "Lujan, Buenos Aires" → NO match
-      const isExactMatch = normalized === alias;
-      const isWithCountry =
-        normalized === `${alias}, ${definition.country?.toLowerCase()}` ||
-        normalized === `${alias} ${definition.country?.toLowerCase()}`;
-
-      if (isExactMatch || isWithCountry) {
-        logger.info(
-          `🗺️ Zona grande detectada: "${location}" → ${definition.subzones.length} sub-zonas`
-        );
-        return {
-          isLargeZone: true,
-          originalLocation: location,
-          subzones: definition.subzones,
-          zoneName,
-          country: definition.country,
-        };
-      }
-    }
-  }
-
-  // Si no es zona grande conocida, buscar directamente en esa ubicación
-  logger.info(`📍 Ubicación específica: "${location}" (búsqueda directa)`);
   return {
     isLargeZone: false,
     originalLocation: location,
-    subzones: [location],
+    subzones: [location], // El scraper expandirá esto con grilla
   };
 }
 
 /**
  * Obtiene todas las zonas disponibles (para mostrar en UI)
+ * DEPRECATED: El sistema ahora funciona con cualquier ubicación
  */
 export function getAvailableZones(): Array<{
   name: string;

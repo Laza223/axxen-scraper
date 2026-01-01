@@ -28,14 +28,21 @@ export class CacheService {
       this.redis = new Redis(redisUrl, {
         maxRetriesPerRequest: 3,
         lazyConnect: true,
-        retryStrategy: (times: number) => Math.min(times * 100, 3000),
+        retryStrategy: (times: number) => {
+          if (times > 3) {
+            logger.warn(
+              "⚠️ Redis no disponible después de 3 intentos, usando caché en memoria"
+            );
+            return null; // Deja de reintentar
+          }
+          return Math.min(times * 100, 3000);
+        },
+        enableOfflineQueue: false,
       });
 
-      await this.redis.connect();
-      this.isRedisAvailable = true;
-      logger.info("✅ Redis conectado correctamente");
-
+      // Registrar handlers ANTES de conectar
       this.redis.on("error", (err) => {
+        if (!this.isRedisAvailable) return; // Solo loggear si estaba disponible
         logger.warn(`⚠️ Redis error: ${err.message}`);
         this.isRedisAvailable = false;
       });
@@ -43,9 +50,22 @@ export class CacheService {
       this.redis.on("reconnecting", () => {
         logger.info("🔄 Reconectando a Redis...");
       });
+
+      this.redis.on("end", () => {
+        this.isRedisAvailable = false;
+      });
+
+      await this.redis.connect();
+      this.isRedisAvailable = true;
+      logger.info("✅ Redis conectado correctamente");
     } catch (error) {
       logger.warn("⚠️ Redis no disponible, usando caché en memoria");
       this.isRedisAvailable = false;
+      // Desconectar el cliente para evitar más intentos
+      if (this.redis) {
+        this.redis.disconnect();
+        this.redis = null;
+      }
     }
   }
 
@@ -101,6 +121,23 @@ export class CacheService {
       }
     } catch (error) {
       logger.warn(`Cache set error: ${error}`);
+    }
+  }
+
+  /**
+   * Eliminar dato del caché
+   */
+  async delete(key: string): Promise<void> {
+    try {
+      if (this.isRedisAvailable && this.redis) {
+        await this.redis.del(key);
+        logger.debug(`🗑️ Cache DELETE (Redis): ${key}`);
+      } else {
+        this.memoryCache.delete(key);
+        logger.debug(`🗑️ Cache DELETE (Memory): ${key}`);
+      }
+    } catch (error) {
+      logger.warn(`Cache delete error: ${error}`);
     }
   }
 
