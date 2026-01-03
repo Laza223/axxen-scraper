@@ -39,6 +39,12 @@ interface Lead {
   hasWebsite: boolean;
   websiteUrl?: string;
   leadScore: number;
+  // 🆕 Campos de calidad y categorización
+  qualityScore?: number; // 0-100 score de calidad del lead
+  qualityGrade?: string; // A, B, C, D, F
+  businessSize?: string; // franchise, chain, local, independent
+  businessType?: string; // Tipo de negocio detectado
+  chainName?: string; // Nombre de franquicia si aplica
   outreachStatus: string;
   googleMapsUrl?: string;
   facebookUrl?: string;
@@ -218,21 +224,29 @@ const SearchModal = ({
     keyword: string,
     location: string,
     maxResults: number,
-    strictMatch: boolean
+    strictMatch: boolean,
+    useSynonyms: boolean
   ) => void;
   loading: boolean;
 }) => {
   const [keyword, setKeyword] = useState("");
   const [location, setLocation] = useState("");
-  const [maxResults, setMaxResults] = useState(30);
-  const [strictMatch, setStrictMatch] = useState(false); // 🆕 Modo estricto
+  const [maxResults, setMaxResults] = useState(100); // Default a 100 leads
+  const [strictMatch, setStrictMatch] = useState(false);
+  const [useSynonyms, setUseSynonyms] = useState(false); // 🆕 Expandir con sinónimos
 
   if (!isOpen) return null;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (keyword.trim() && location.trim()) {
-      onSearch(keyword.trim(), location.trim(), maxResults, strictMatch);
+      onSearch(
+        keyword.trim(),
+        location.trim(),
+        maxResults,
+        strictMatch,
+        useSynonyms
+      );
     }
   };
 
@@ -242,7 +256,7 @@ const SearchModal = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
+    <div className="fixed inset-0 z-[60] flex items-center justify-center">
       <div
         className="absolute inset-0 bg-black/70 backdrop-blur-sm"
         onClick={onClose}
@@ -339,6 +353,33 @@ const SearchModal = ({
               <div
                 className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${
                   strictMatch ? "translate-x-7" : "translate-x-1"
+                }`}
+              />
+            </button>
+          </div>
+
+          {/* 🆕 Toggle de sinónimos */}
+          <div className="flex items-center justify-between p-3 bg-zinc-800/50 border border-zinc-700 rounded-xl">
+            <div>
+              <p className="text-sm font-medium text-zinc-300">
+                Expandir con sinónimos
+              </p>
+              <p className="text-xs text-zinc-500 mt-0.5">
+                {useSynonyms
+                  ? "Buscará también términos relacionados (dentista → odontólogo, clínica dental)"
+                  : "Solo buscará el término exacto que escribas"}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setUseSynonyms(!useSynonyms)}
+              className={`relative w-12 h-6 rounded-full transition-colors ${
+                useSynonyms ? "bg-emerald-600" : "bg-zinc-600"
+              }`}
+            >
+              <div
+                className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${
+                  useSynonyms ? "translate-x-7" : "translate-x-1"
                 }`}
               />
             </button>
@@ -463,7 +504,7 @@ const ExportModal = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
+    <div className="fixed inset-0 z-[60] flex items-center justify-center">
       <div
         className="absolute inset-0 bg-black/70 backdrop-blur-sm"
         onClick={onClose}
@@ -635,7 +676,7 @@ const ExportModal = ({
 // ==================== APP ====================
 
 // Opciones de cantidad de resultados
-const MAX_RESULTS_OPTIONS = [5, 10, 15, 30, 50];
+const MAX_RESULTS_OPTIONS = [10, 25, 50, 75, 100];
 
 export default function App() {
   const [leads, setLeads] = useState<Lead[]>([]);
@@ -840,10 +881,11 @@ export default function App() {
   const handleScrape = async (
     searchKeyword: string,
     searchLocation: string,
-    searchMaxResults: number = 30,
+    searchMaxResults: number = 100, // Default a 100 leads
     strictMatch: boolean = false,
-    forceRefresh: boolean = false, // 🆕 Forzar re-scraping sin caché
-    excludeExisting: boolean = true // 🆕 Excluir leads existentes
+    forceRefresh: boolean = false,
+    excludeExisting: boolean = true,
+    useSynonyms: boolean = false // 🆕 Expandir búsqueda con sinónimos
   ) => {
     if (!searchKeyword || !searchLocation) {
       setError("Completa keyword y ubicación");
@@ -879,8 +921,9 @@ export default function App() {
         location: searchLocation,
         maxResults: searchMaxResults.toString(),
         strictMatch: strictMatch.toString(),
-        forceRefresh: forceRefresh.toString(), // 🆕
-        excludeExisting: excludeExisting.toString(), // 🆕
+        forceRefresh: forceRefresh.toString(),
+        excludeExisting: excludeExisting.toString(),
+        useSynonyms: useSynonyms.toString(), // 🆕
       });
 
       const eventSource = new EventSource(`${API_URL}/scrape/stream?${params}`);
@@ -1042,7 +1085,8 @@ export default function App() {
         lastSearch.maxResults,
         false, // strictMatch
         true, // forceRefresh - buscar de nuevo sin caché
-        false // excludeExisting - incluir leads existentes
+        false, // excludeExisting - incluir leads existentes
+        false // useSynonyms
       );
     }
   };
@@ -1155,9 +1199,10 @@ export default function App() {
       <SearchModal
         isOpen={searchModalOpen}
         onClose={() => setSearchModalOpen(false)}
-        onSearch={(k, l, m, strict) => {
+        onSearch={(k, l, m, strict, synonyms) => {
           setSearchModalOpen(false);
-          handleScrape(k, l, m, strict);
+          // Pasar todos los parámetros: keyword, location, maxResults, strictMatch, forceRefresh=false, excludeExisting=true, useSynonyms
+          handleScrape(k, l, m, strict, false, true, synonyms);
         }}
         loading={loading}
       />
@@ -1196,7 +1241,7 @@ export default function App() {
 
       {/* Modal de Alertas Premium */}
       {alertsModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
+        <div className="fixed inset-0 z-[60] flex items-center justify-center">
           <div
             className="absolute inset-0 bg-black/70 backdrop-blur-sm"
             onClick={() => setAlertsModalOpen(false)}

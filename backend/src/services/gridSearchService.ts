@@ -47,6 +47,7 @@ export interface GridSearchResult {
 
 // Tamaños de área para determinar el grid
 // Actualizado con soporte para PROVINCIAS y regiones extensas
+// 🆕 MEJORADO: Grillas más densas para encontrar más resultados
 const CITY_SIZE_ESTIMATES: Record<
   string,
   { radiusKm: number; gridSize: number }
@@ -55,14 +56,16 @@ const CITY_SIZE_ESTIMATES: Record<
   province: { radiusKm: 150, gridSize: 8 }, // 64 celdas - cobertura provincial amplia
   // 🆕 Regiones/zonas grandes (Zona Norte GBA, Costa Atlántica, etc.)
   region: { radiusKm: 60, gridSize: 6 }, // 36 celdas - cobertura regional
-  // Grandes ciudades (CABA, Córdoba Capital, Rosario, etc.)
-  large: { radiusKm: 25, gridSize: 5 }, // 25 celdas - muy exhaustivo
+  // Grandes ciudades (CABA, Córdoba Capital, Rosario, Neuquén Capital, etc.)
+  // 🆕 MEJORADO: 6x6=36 celdas en lugar de 5x5=25 para más cobertura
+  large: { radiusKm: 30, gridSize: 6 }, // 36 celdas - cobertura exhaustiva
   // Ciudades medianas (Pilar, Moreno, La Plata, etc.)
-  medium: { radiusKm: 12, gridSize: 4 }, // 16 celdas - buena cobertura
+  // 🆕 MEJORADO: 5x5=25 celdas en lugar de 4x4=16
+  medium: { radiusKm: 15, gridSize: 5 }, // 25 celdas - mejor cobertura
   // Ciudades pequeñas / localidades
-  small: { radiusKm: 6, gridSize: 3 }, // 9 celdas
+  small: { radiusKm: 8, gridSize: 4 }, // 16 celdas
   // Muy pequeñas / barrios específicos
-  tiny: { radiusKm: 3, gridSize: 2 }, // 4 celdas
+  tiny: { radiusKm: 4, gridSize: 3 }, // 9 celdas
 };
 
 /**
@@ -257,37 +260,103 @@ export function estimateCitySize(
     "todo escobar",
   ];
 
-  // Ciudades GRANDES (capitales, ciudades principales)
+  // Ciudades GRANDES (capitales, ciudades principales > 100k habitantes)
   const largeIndicators = [
+    // CABA
     "capital federal",
     "caba",
     "ciudad autonoma",
     "buenos aires ciudad",
+    // Córdoba
     "cordoba capital",
     "ciudad de cordoba",
+    // Rosario
     "rosario",
+    "gran rosario",
+    // Mendoza
     "mendoza capital",
     "ciudad de mendoza",
+    // Tucumán
     "tucuman capital",
     "san miguel de tucuman",
+    // La Plata
     "la plata",
+    // Mar del Plata
     "mar del plata",
+    // Salta
     "salta capital",
     "ciudad de salta",
+    // Santa Fe
     "santa fe capital",
     "ciudad de santa fe",
-    "san salvador de jujuy",
-    "neuquen capital",
-    "ciudad de neuquen",
-    "resistencia",
-    "corrientes capital",
-    "posadas",
+    // San Juan
     "san juan capital",
     "ciudad de san juan",
+    "gran san juan",
+    // Resistencia (Chaco)
+    "resistencia",
+    "gran resistencia",
+    // Corrientes
+    "corrientes capital",
+    "ciudad de corrientes",
+    // Posadas (Misiones)
+    "posadas",
+    "ciudad de posadas",
+    // Neuquén
+    "neuquen capital",
+    "ciudad de neuquen",
+    // Paraná (Entre Ríos)
+    "parana",
+    "ciudad de parana",
+    // Santiago del Estero
+    "santiago del estero capital",
+    "ciudad de santiago",
+    // San Salvador de Jujuy
+    "san salvador de jujuy",
+    "jujuy capital",
+    // Formosa
+    "formosa capital",
+    "ciudad de formosa",
+    // San Luis
+    "san luis capital",
+    "ciudad de san luis",
+    // Río Cuarto
+    "rio cuarto",
+    // Bahía Blanca
+    "bahia blanca",
+    // Comodoro Rivadavia
+    "comodoro rivadavia",
+    // San Fernando del Valle de Catamarca
+    "catamarca capital",
+    "san fernando del valle",
+    // La Rioja
+    "la rioja capital",
+    "ciudad de la rioja",
+    // San Rafael
+    "san rafael",
+    // Concordia
+    "concordia",
+    // Villa María
+    "villa maria",
+    // Santa Rosa (La Pampa)
+    "santa rosa la pampa",
+    // Rafaela
+    "rafaela",
+    // Trelew
+    "trelew",
+    // Río Gallegos
+    "rio gallegos",
+    // Ushuaia
+    "ushuaia",
+    // Viedma
+    "viedma",
+    // Rawson
+    "rawson",
   ];
 
-  // Partidos/ciudades MEDIANAS del conurbano y otras
+  // Partidos/ciudades MEDIANAS (conurbano + ciudades 20k-100k)
   const mediumIndicators = [
+    // ===== CONURBANO BONAERENSE =====
     // Zona Norte
     "pilar",
     "tigre",
@@ -325,34 +394,309 @@ export function estimateCitySize(
     "ezeiza",
     "presidente peron",
     "san vicente",
-    // Otras ciudades medianas
-    "bahia blanca",
-    "rio cuarto",
-    "villa maria",
+
+    // ===== INTERIOR BUENOS AIRES =====
     "san nicolas",
     "pergamino",
     "tandil",
     "olavarria",
     "junin",
-    "san rafael",
-    "comodoro rivadavia",
-    "rawson",
-    "trelew",
-    "ushuaia",
-    "rio gallegos",
-    "santa rosa",
+    "chivilcoy",
+    "necochea",
+    "azul",
+    "trenque lauquen",
+    "mercedes",
+    "bragado",
+    "chacabuco",
+    "nueve de julio",
+    "tres arroyos",
+    "bolivar",
+    "pehuajo",
+    "lincoln",
+    "lobos",
+    "chascomus",
+    "dolores",
+    "pinamar",
+    "villa gesell",
+    "miramar",
+    "general pueyrredon",
+    "coronel suarez",
+    "general villegas",
+
+    // ===== CÓRDOBA =====
+    "villa carlos paz",
+    "alta gracia",
+    "villa allende",
+    "jesus maria",
+    "cosquin",
+    "la falda",
+    "bell ville",
+    "san francisco cordoba",
+    "marcos juarez",
+    "morteros",
+    "cruz del eje",
+    "dean funes",
+    "corral de bustos",
+    "arroyito",
+
+    // ===== SANTA FE =====
+    "venado tuerto",
+    "reconquista",
+    "san lorenzo",
+    "casilda",
+    "esperanza",
+    "san justo santa fe",
+    "sunchales",
+    "rufino",
+    "villa constitucion",
+    "granadero baigorria",
+    "funes",
+    "roldan",
+
+    // ===== MENDOZA =====
+    "godoy cruz",
+    "guaymallen",
+    "las heras mendoza",
+    "maipu mendoza",
+    "lujan de cuyo",
+    "general alvear",
+    "rivadavia mendoza",
+    "tunuyan",
+    "san martin mendoza",
+    "malargue",
+
+    // ===== TUCUMÁN =====
+    "banda del rio sali",
+    "yerba buena",
+    "tafi viejo",
+    "concepcion tucuman",
+    "alderetes",
+    "monteros",
+    "aguilares",
+
+    // ===== ENTRE RÍOS =====
+    "gualeguaychu",
+    "concepcion del uruguay",
+    "gualeguay",
+    "colon entre rios",
+    "victoria entre rios",
+    "villaguay",
+    "la paz entre rios",
+    "crespo",
+    "san jose de feliciano",
+
+    // ===== CHACO =====
+    "presidencia roque saenz pena",
+    "villa angela",
+    "charata",
+    "general san martin chaco",
+    "quitilipi",
+    "machagai",
+
+    // ===== MISIONES =====
+    "obera",
+    "eldorado",
+    "puerto iguazu",
+    "jardin america",
+    "leandro n alem",
+    "apostoles",
+    "montecarlo",
+    "san vicente misiones",
+
+    // ===== CORRIENTES =====
+    "goya",
+    "paso de los libres",
+    "curuzú cuatia",
+    "santo tome corrientes",
+    "bella vista corrientes",
+    "mercedes corrientes",
+
+    // ===== SALTA =====
+    "oran",
+    "tartagal",
+    "general guemes",
+    "metan",
+    "rosario de la frontera",
+    "cafayate",
+    "embarcacion",
+
+    // ===== JUJUY =====
+    "san pedro de jujuy",
+    "libertador general san martin",
+    "palpala",
+    "humahuaca",
+    "tilcara",
+    "la quiaca",
+
+    // ===== SANTIAGO DEL ESTERO =====
+    "la banda",
+    "teran",
+    "frias",
+    "anatuya",
+    "quimili",
+    "añatuya",
+
+    // ===== NEUQUÉN =====
+    "centenario",
+    "plottier",
+    "cutral co",
+    "plaza huincul",
+    "zapala",
+    "san martin de los andes",
+    "villa la angostura",
+    "junin de los andes",
+    "chos malal",
+
+    // ===== RÍO NEGRO =====
+    "general roca",
+    "cipolletti",
+    "san carlos de bariloche",
+    "bariloche",
+    "allen",
+    "villa regina",
+    "cervantes",
+    "cinco saltos",
+    "el bolson",
+
+    // ===== CHUBUT =====
+    "puerto madryn",
+    "esquel",
+    "sarmiento chubut",
+
+    // ===== SAN JUAN =====
+    "rawson san juan",
+    "chimbas",
+    "rivadavia san juan",
+    "pocito",
+    "santa lucia san juan",
+    "caucete",
+
+    // ===== SAN LUIS =====
+    "villa mercedes san luis",
+    "merlo san luis",
+    "la punta san luis",
+
+    // ===== CATAMARCA =====
+    "valle viejo",
+    "fray mamerto esquiu",
+    "tinogasta",
+    "belen catamarca",
+
+    // ===== LA RIOJA =====
+    "chilecito",
+    "aimogasta",
+    "chamical",
+
+    // ===== LA PAMPA =====
     "general pico",
-    "formosa capital",
-    "san luis capital",
+    "toay",
+    "eduardo castex",
+    "general acha",
+
+    // ===== SANTA CRUZ =====
+    "caleta olivia",
+    "pico truncado",
+    "puerto deseado",
+    "el calafate",
+    "las heras santa cruz",
+
+    // ===== TIERRA DEL FUEGO =====
+    "rio grande",
+    "tolhuin",
   ];
 
-  // Localidades PEQUEÑAS / barrios específicos
+  // Localidades PEQUEÑAS / barrios específicos / poblaciones menores
   const smallIndicators = [
+    // Indicadores genéricos de barrios
     "barrio",
+    "barrio cerrado",
     "localidad de",
     "villa",
     "country",
     "club de campo",
+    "pueblo",
+    "paraje",
+    "comuna",
+    "colonia",
+    "parque industrial",
+
+    // Barrios conocidos de CABA
+    "palermo",
+    "recoleta",
+    "belgrano",
+    "caballito",
+    "nuñez",
+    "saavedra",
+    "villa urquiza",
+    "villa devoto",
+    "villa del parque",
+    "villa crespo",
+    "almagro",
+    "boedo",
+    "san telmo",
+    "la boca",
+    "barracas",
+    "parque patricios",
+    "flores",
+    "floresta",
+    "liniers",
+    "mataderos",
+    "villa lugano",
+    "villa soldati",
+    "villa riachuelo",
+    "pompeya",
+    "constitución",
+    "monserrat",
+    "san nicolas caba",
+    "retiro",
+    "puerto madero",
+    "colegiales",
+    "chacarita",
+    "paternal",
+    "agronomia",
+    "villa ortuzar",
+    "parque chas",
+    "villa pueyrredon",
+    "villa real",
+    "versalles",
+    "monte castro",
+    "velez sarsfield",
+    "villa luro",
+    "parque avellaneda",
+    "villa general mitre",
+    "coghlan",
+
+    // Algunas localidades pequeñas de Buenos Aires
+    "city bell",
+    "gonnet",
+    "villa elisa",
+    "arturo segui",
+    "ringuelet",
+    "tolosa",
+    "los hornos",
+    "san carlos la plata",
+    "gorina",
+    "hernandez",
+    "del viso",
+    "maquinista savio",
+    "benavidez",
+    "don torcuato",
+    "general pacheco",
+    "el talar",
+    "ricardo rojas",
+    "nordelta",
+    "villanueva",
+    "fisherton",
+    "funes pueblo",
+    "carcaraña",
+    "puerto san martin",
+
+    // Barrios de otras ciudades
+    "nueva cordoba",
+    "cerro de las rosas",
+    "guemes cordoba",
+    "alta cordoba",
+    "centro cordoba",
   ];
 
   // Verificar tamaño en orden (de mayor a menor)

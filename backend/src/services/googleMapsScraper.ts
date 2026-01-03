@@ -23,7 +23,7 @@ import synonymService from "./synonymService";
 const CONFIG = {
   HEADLESS: true, // true = sin ventana, false = ver el navegador
   TIMEOUT: 45000, // ⬆️ Aumentado para provincias grandes
-  MAX_SCROLL_ATTEMPTS: 50, // ⬆️ Más intentos para zonas con muchos resultados
+  MAX_SCROLL_ATTEMPTS: 80, // ⬆️ Aumentado para obtener más resultados
   MAX_CONCURRENT_TABS: 3, // Tabs paralelas para detalles
   RETRY_ATTEMPTS: 3,
   ENABLE_GRID_SEARCH: true, // Habilitar búsqueda por grilla para cubrir toda el área
@@ -785,8 +785,8 @@ class GoogleMapsScraper {
 
           await this.humanSleep(1500, 2500);
 
-          // 🆕 Mover el mapa ligeramente y presionar "Buscar en esta área"
-          // Esto fuerza a Google a cargar resultados de la nueva ubicación
+          // 🆕 MEJORADO: Forzar "Buscar en esta área" con múltiples estrategias
+          // Esto es CRÍTICO para obtener resultados de la nueva ubicación
           const searchInAreaSuccess = await this.moveMapAndSearch(
             page,
             cell.center.lat,
@@ -794,8 +794,10 @@ class GoogleMapsScraper {
             keyword
           );
 
-          if (searchInAreaSuccess) {
-            logger.debug(`   ↳ "Buscar en esta área" ejecutado exitosamente`);
+          if (!searchInAreaSuccess) {
+            logger.warn(
+              `   ⚠️ No se pudo forzar actualización en celda ${cell.label}, usando resultados disponibles`
+            );
           }
 
           // Esperar el panel de resultados
@@ -1041,6 +1043,7 @@ class GoogleMapsScraper {
   /**
    * 🆕 Búsqueda expandida con sinónimos
    * Realiza múltiples búsquedas con variantes del término y consolida resultados
+   * MEJORADO: Usa más sinónimos y busca más resultados por término
    */
   async scrapePlacesWithSynonyms(
     options: ScrapeOptions
@@ -1051,8 +1054,9 @@ class GoogleMapsScraper {
     // Obtener sinónimos para el término de búsqueda
     const synonyms = synonymService.getSynonyms(keyword);
 
-    // Limitar cantidad de variantes (máximo 4 para no demorar demasiado)
-    const searchTerms = synonyms.slice(0, 4);
+    // 🆕 MEJORADO: Usar hasta 10 sinónimos para máxima cobertura
+    const maxSynonyms = Math.min(10, synonyms.length);
+    const searchTerms = synonyms.slice(0, maxSynonyms);
 
     if (searchTerms.length <= 1) {
       // Sin sinónimos, hacer búsqueda normal
@@ -1068,20 +1072,50 @@ class GoogleMapsScraper {
 
     const allResults: ScrapedPlace[] = [];
     const seenPlaceIds = new Set<string>();
-    const resultsPerTerm = Math.ceil(maxResults / searchTerms.length);
+
+    // 🆕 MEJORADO: Buscar 2.5x más resultados para compensar duplicados masivos
+    // Entre sinónimos similares hay ~60-70% duplicados
+    const basePerTerm = Math.ceil(maxResults / searchTerms.length);
+    const resultsPerTerm = Math.ceil(basePerTerm * 2.5); // ⬆️ Aumentado de 1.5 a 2.5
+
+    logger.info(
+      `📊 Estrategia: ${resultsPerTerm} resultados por cada ${searchTerms.length} términos`
+    );
 
     // Realizar búsqueda por cada sinónimo
-    for (let i = 0; i < searchTerms.length; i++) {
+    for (
+      let i = 0;
+      i < searchTerms.length && allResults.length < maxResults;
+      i++
+    ) {
       const term = searchTerms[i];
+      const remainingNeeded = maxResults - allResults.length;
+
+      // Si ya tenemos suficientes, terminar
+      if (remainingNeeded <= 0) {
+        logger.info(
+          `✅ Objetivo de ${maxResults} leads alcanzado, terminando búsqueda de sinónimos`
+        );
+        break;
+      }
+
+      // Ajustar cuántos buscar según lo que falta
+      const toSearch = Math.max(
+        resultsPerTerm,
+        Math.ceil(remainingNeeded * 1.3)
+      );
+
       logger.info(
-        `🔍 [${i + 1}/${searchTerms.length}] Buscando: "${term} en ${location}"`
+        `🔍 [${i + 1}/${
+          searchTerms.length
+        }] Buscando: "${term} en ${location}" (objetivo: ${toSearch})`
       );
 
       try {
         const results = await this.scrapePlaces({
           ...options,
           keyword: term,
-          maxResults: resultsPerTerm,
+          maxResults: toSearch,
           // Desactivar procesamiento individual, lo haremos al final
           deduplicateResults: false,
           calculateQualityScore: false,
@@ -1669,7 +1703,7 @@ class GoogleMapsScraper {
 
   /**
    * 🗺️ Mover el mapa a coordenadas específicas y presionar "Buscar en esta área"
-   * Simula comportamiento humano de arrastrar el mapa
+   * 🆕 MEJORADO: Combina múltiples estrategias para garantizar la actualización
    */
   private async moveMapAndSearch(
     page: Page,
@@ -1677,82 +1711,150 @@ class GoogleMapsScraper {
     targetLng: number,
     keyword: string
   ): Promise<boolean> {
-    try {
-      logger.debug(
-        `🗺️ Moviendo mapa a (${targetLat.toFixed(4)}, ${targetLng.toFixed(4)})`
-      );
+    const MAX_RETRIES = 3;
+    let success = false;
 
-      // Método 1: Usar drag & drop en el mapa (más humano)
-      const mapContainer = await page.$('div[id="scene"]');
-      if (mapContainer) {
-        const box = await mapContainer.boundingBox();
-        if (box) {
-          // Calcular movimiento aleatorio pero significativo
-          const startX = box.x + box.width / 2;
-          const startY = box.y + box.height / 2;
+    logger.debug(
+      `🗺️ Forzando actualización de resultados en (${targetLat.toFixed(
+        4
+      )}, ${targetLng.toFixed(4)})`
+    );
 
-          // Mover en dirección aleatoria (simula arrastre humano)
-          const directions = [
-            { dx: -200, dy: 0, name: "oeste" },
-            { dx: 200, dy: 0, name: "este" },
-            { dx: 0, dy: -150, name: "norte" },
-            { dx: 0, dy: 150, name: "sur" },
-            { dx: -150, dy: -100, name: "noroeste" },
-            { dx: 150, dy: -100, name: "noreste" },
-            { dx: -150, dy: 100, name: "suroeste" },
-            { dx: 150, dy: 100, name: "sureste" },
-          ];
-
-          const randomDir =
-            directions[Math.floor(Math.random() * directions.length)];
-
-          // Simular arrastre humano con movimiento gradual
-          await page.mouse.move(startX, startY);
-          await this.humanSleep(100, 200);
-          await page.mouse.down();
-          await this.humanSleep(50, 100);
-
-          // Movimiento gradual (más humano)
-          const steps = 5;
-          for (let step = 1; step <= steps; step++) {
-            await page.mouse.move(
-              startX + (randomDir.dx * step) / steps,
-              startY + (randomDir.dy * step) / steps
-            );
-            await this.sleep(30 + Math.random() * 20);
-          }
-
-          await page.mouse.up();
-          logger.debug(`   ↳ Mapa arrastrado hacia ${randomDir.name}`);
-
-          await this.humanSleep(800, 1500);
+    for (let attempt = 1; attempt <= MAX_RETRIES && !success; attempt++) {
+      try {
+        if (attempt > 1) {
+          logger.debug(
+            `   ↳ Intento ${attempt}/${MAX_RETRIES} de forzar "Buscar en esta área"`
+          );
         }
+
+        // ============================================================
+        // ESTRATEGIA 1: Arrastrar el mapa (simula comportamiento humano)
+        // ============================================================
+        const mapContainer = await page.$('div[id="scene"]');
+        if (mapContainer) {
+          const box = await mapContainer.boundingBox();
+          if (box) {
+            const startX = box.x + box.width / 2;
+            const startY = box.y + box.height / 2;
+
+            // Direcciones de arrastre - varían según el intento
+            const directions = [
+              { dx: -250, dy: -150, name: "noroeste" },
+              { dx: 250, dy: 150, name: "sureste" },
+              { dx: -200, dy: 200, name: "suroeste" },
+              { dx: 200, dy: -200, name: "noreste" },
+            ];
+
+            // Usar una dirección diferente en cada intento
+            const dir = directions[(attempt - 1) % directions.length];
+
+            // Simular arrastre humano con movimiento gradual
+            await page.mouse.move(startX, startY);
+            await this.humanSleep(100, 200);
+            await page.mouse.down();
+            await this.humanSleep(50, 100);
+
+            // Movimiento gradual (más humano y más largo)
+            const steps = 8;
+            for (let step = 1; step <= steps; step++) {
+              await page.mouse.move(
+                startX + (dir.dx * step) / steps,
+                startY + (dir.dy * step) / steps
+              );
+              await this.sleep(25 + Math.random() * 25);
+            }
+
+            await page.mouse.up();
+            logger.debug(`   ↳ Mapa arrastrado hacia ${dir.name}`);
+
+            await this.humanSleep(600, 1000);
+          }
+        }
+
+        // ============================================================
+        // ESTRATEGIA 2: Buscar y presionar "Buscar en esta área"
+        // ============================================================
+        success = await this.clickSearchInArea(page);
+
+        if (success) {
+          // Esperar a que carguen los nuevos resultados
+          await this.humanSleep(2000, 3500);
+          await page
+            .waitForSelector('div[role="feed"]', { timeout: 15000 })
+            .catch(() => {});
+
+          logger.info(`   ✅ "Buscar en esta área" ejecutado exitosamente`);
+          return true;
+        }
+
+        // ============================================================
+        // ESTRATEGIA 3: Zoom in/out para forzar la aparición del botón
+        // ============================================================
+        if (!success && attempt < MAX_RETRIES) {
+          logger.debug(`   ↳ Botón no encontrado, intentando zoom...`);
+
+          // Hacer zoom out y luego in
+          await this.zoomMap(page, "out");
+          await this.humanSleep(400, 700);
+          await this.zoomMap(page, "out");
+          await this.humanSleep(600, 1000);
+          await this.zoomMap(page, "in");
+          await this.humanSleep(400, 700);
+          await this.zoomMap(page, "in");
+          await this.humanSleep(800, 1200);
+
+          // Intentar presionar el botón de nuevo
+          success = await this.clickSearchInArea(page);
+
+          if (success) {
+            await this.humanSleep(2000, 3000);
+            logger.info(
+              `   ✅ "Buscar en esta área" ejecutado después de zoom`
+            );
+            return true;
+          }
+        }
+
+        // ============================================================
+        // ESTRATEGIA 4: Refrescar búsqueda vía URL (fallback agresivo)
+        // ============================================================
+        if (!success && attempt === MAX_RETRIES) {
+          logger.debug(`   ↳ Forzando recarga de búsqueda vía URL...`);
+
+          // Construir URL con timestamp para forzar recarga
+          const timestamp = Date.now();
+          const forceReloadUrl = `https://www.google.com/maps/search/${encodeURIComponent(
+            keyword
+          )}/@${targetLat},${targetLng},15z?entry=tts&g_ep=t${timestamp}`;
+
+          await page.goto(forceReloadUrl, {
+            waitUntil: "networkidle2",
+            timeout: 30000,
+          });
+
+          await this.humanSleep(2000, 3000);
+
+          // Verificar que hay resultados
+          const hasResults = await page.$('div[role="feed"]');
+          if (hasResults) {
+            logger.info(`   ✅ Búsqueda forzada vía URL exitosa`);
+            return true;
+          }
+        }
+      } catch (error) {
+        logger.warn(
+          `   ⚠️ Error en intento ${attempt}: ${(error as Error).message}`
+        );
       }
-
-      // Método 2: Buscar y presionar el botón "Buscar en esta área"
-      const searchInAreaClicked = await this.clickSearchInArea(page);
-
-      if (searchInAreaClicked) {
-        // Esperar a que carguen los nuevos resultados
-        await this.humanSleep(2000, 3000);
-        await page
-          .waitForSelector('div[role="feed"]', { timeout: 10000 })
-          .catch(() => {});
-        return true;
-      }
-
-      // Si no encontramos el botón, hacer zoom in/out para forzar la aparición
-      await this.zoomMap(page, "out");
-      await this.humanSleep(500, 1000);
-      await this.zoomMap(page, "in");
-      await this.humanSleep(1000, 1500);
-
-      // Intentar de nuevo
-      return await this.clickSearchInArea(page);
-    } catch (error) {
-      logger.warn(`⚠️ Error moviendo mapa: ${(error as Error).message}`);
-      return false;
     }
+
+    // Si llegamos aquí, al menos intentamos todas las estrategias
+    // Puede que los resultados ya estén cargados de la navegación inicial
+    logger.debug(
+      `   ↳ No se pudo presionar "Buscar en esta área", continuando con resultados actuales`
+    );
+    return false;
   }
 
   /**
@@ -1907,8 +2009,8 @@ class GoogleMapsScraper {
           noNewResultsCount++;
           scrollAttempts++;
 
-          // 🆕 Aumentado a 5 intentos para dar más chance de cargar en conexiones lentas
-          if (noNewResultsCount >= 5) {
+          // 🆕 Aumentado a 8 intentos - Google Maps a veces tarda en cargar
+          if (noNewResultsCount >= 8) {
             logger.info(
               `📜 Fin de resultados alcanzado después de ${scrollAttempts} scrolls (${placeUrls.size} lugares)`
             );
@@ -1927,7 +2029,7 @@ class GoogleMapsScraper {
             var feed = document.querySelector('div[role="feed"]');
             if (feed) {
               // 🆕 Scroll más agresivo para cargar más resultados
-              var scrollAmount = 1000 + Math.floor(Math.random() * 500);
+              var scrollAmount = 1500 + Math.floor(Math.random() * 500); // ⬆️ 1500 base
               feed.scrollTop = feed.scrollTop + scrollAmount;
             }
           })

@@ -240,10 +240,18 @@ app.get("/api/scrape/stream", async (req: Request, res: Response) => {
             ? googleMapsScraper.scrapePlacesWithSynonyms.bind(googleMapsScraper)
             : googleMapsScraper.scrapePlaces.bind(googleMapsScraper);
 
+          // 🆕 MEJORADO: Calcular cuántos resultados necesitamos de esta zona
+          // Considerar cuántos faltan y cuántas zonas quedan
+          const remainingNeeded = targetNewResults - newFound;
+          const remainingZones = zones.length - i;
+          // Buscar más de lo necesario para compensar duplicados y filtros
+          const perZoneTarget =
+            Math.ceil((remainingNeeded / remainingZones) * 1.5) + 10;
+
           const places = await scrapeMethod({
             keyword,
             location: zone,
-            maxResults: Math.ceil(maxResults / zones.length) + 5,
+            maxResults: Math.max(perZoneTarget, 50), // Mínimo 50 por zona
             strictMatch,
             forceRefresh,
           });
