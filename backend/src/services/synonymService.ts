@@ -31,9 +31,9 @@ const SYNONYM_DICTIONARY: Record<
     keywords: [
       "inmobiliaria",
       "inmobiliarias",
-      "real estate",
-      "bienes raices",
       "propiedades",
+      "bienes raices",
+      "real estate",
     ],
     synonyms: [
       "inmobiliaria",

@@ -1662,7 +1662,10 @@ const server = app.listen(port, async () => {
 
   // Inicializar sistema de colas
   try {
-    // Registrar el procesador de búsquedas
+    // Primero inicializar la cola
+    await queueService.initialize();
+
+    // Luego registrar el procesador de búsquedas
     queueService.registerProcessor(async (job) => {
       const { keyword, location, maxResults } = job.data;
       const startTime = Date.now();
@@ -1707,7 +1710,6 @@ const server = app.listen(port, async () => {
       };
     });
 
-    await queueService.initialize();
     logger.info("📋 Sistema de colas Bull inicializado");
   } catch (error) {
     logger.warn(`⚠️ Cola Bull no disponible (Redis offline?): ${error}`);

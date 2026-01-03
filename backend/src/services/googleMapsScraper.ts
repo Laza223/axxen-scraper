@@ -915,15 +915,15 @@ class GoogleMapsScraper {
               }
             }
 
-            // Pequeño delay entre batches
+            // Pequeño delay entre batches (⚡ reducido)
             if (batch + BATCH_SIZE < newPlaceUrls.length) {
-              await this.humanSleep(200, 400);
+              await this.humanSleep(100, 200);
             }
           }
 
-          // Delay entre celdas
+          // Delay entre celdas (⚡ reducido de 1.5-2.5s a 0.8-1.2s)
           if (i < gridCells.length - 1) {
-            await this.humanSleep(1500, 2500);
+            await this.humanSleep(800, 1200);
           }
         } catch (error: any) {
           logger.warn(`⚠️ Error en celda ${cell.label}: ${error.message}`);
@@ -1135,8 +1135,8 @@ class GoogleMapsScraper {
     // Obtener sinónimos para el término de búsqueda
     const synonyms = synonymService.getSynonyms(keyword);
 
-    // 🆕 MEJORADO: Usar hasta 10 sinónimos para máxima cobertura
-    const maxSynonyms = Math.min(10, synonyms.length);
+    // ⚡ OPTIMIZADO: Máximo 4 sinónimos para velocidad (antes era 10)
+    const maxSynonyms = Math.min(4, synonyms.length);
     const searchTerms = synonyms.slice(0, maxSynonyms);
 
     if (searchTerms.length <= 1) {
@@ -1154,10 +1154,9 @@ class GoogleMapsScraper {
     const allResults: ScrapedPlace[] = [];
     const seenPlaceIds = new Set<string>();
 
-    // 🆕 MEJORADO: Buscar 2.5x más resultados para compensar duplicados masivos
-    // Entre sinónimos similares hay ~60-70% duplicados
+    // ⚡ OPTIMIZADO: Buscar 1.3x más resultados (antes era 2.5x que era excesivo)
     const basePerTerm = Math.ceil(maxResults / searchTerms.length);
-    const resultsPerTerm = Math.ceil(basePerTerm * 2.5); // ⬆️ Aumentado de 1.5 a 2.5
+    const resultsPerTerm = Math.ceil(basePerTerm * 1.3);
 
     logger.info(
       `📊 Estrategia: ${resultsPerTerm} resultados por cada ${searchTerms.length} términos`
@@ -1215,9 +1214,17 @@ class GoogleMapsScraper {
           `   ↳ Encontrados: ${results.length} (únicos totales: ${allResults.length})`
         );
 
-        // Delay entre búsquedas
+        // ⚡ OPTIMIZADO: Early exit si ya tenemos suficientes
+        if (allResults.length >= maxResults) {
+          logger.info(
+            `✅ Ya tenemos ${allResults.length}/${maxResults} leads, terminando`
+          );
+          break;
+        }
+
+        // Delay entre búsquedas (reducido de 3-5s a 1-2s)
         if (i < searchTerms.length - 1) {
-          await this.sleep(3000 + Math.random() * 2000);
+          await this.sleep(1000 + Math.random() * 1000);
         }
       } catch (error: any) {
         logger.warn(`⚠️ Error en búsqueda "${term}": ${error.message}`);

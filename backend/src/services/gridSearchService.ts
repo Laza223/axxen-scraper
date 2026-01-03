@@ -46,26 +46,24 @@ export interface GridSearchResult {
 }
 
 // Tamaños de área para determinar el grid
-// Actualizado con soporte para PROVINCIAS y regiones extensas
-// 🆕 MEJORADO: Grillas más densas para encontrar más resultados
+// ⚡ OPTIMIZADO: Radios más precisos para no buscar fuera del área
 const CITY_SIZE_ESTIMATES: Record<
   string,
   { radiusKm: number; gridSize: number }
 > = {
-  // 🆕 PROVINCIAS completas (Buenos Aires, Córdoba, Santa Fe, etc.)
-  province: { radiusKm: 150, gridSize: 8 }, // 64 celdas - cobertura provincial amplia
-  // 🆕 Regiones/zonas grandes (Zona Norte GBA, Costa Atlántica, etc.)
-  region: { radiusKm: 60, gridSize: 6 }, // 36 celdas - cobertura regional
-  // Grandes ciudades (CABA, Córdoba Capital, Rosario, Neuquén Capital, etc.)
-  // 🆕 MEJORADO: 6x6=36 celdas en lugar de 5x5=25 para más cobertura
-  large: { radiusKm: 30, gridSize: 6 }, // 36 celdas - cobertura exhaustiva
-  // Ciudades medianas (Pilar, Moreno, La Plata, etc.)
-  // 🆕 MEJORADO: 5x5=25 celdas en lugar de 4x4=16
-  medium: { radiusKm: 15, gridSize: 5 }, // 25 celdas - mejor cobertura
+  // PROVINCIAS completas (Buenos Aires, Córdoba, Santa Fe, etc.)
+  province: { radiusKm: 100, gridSize: 4 }, // 16 celdas
+  // Regiones/zonas grandes (Zona Norte GBA, Costa Atlántica, etc.)
+  region: { radiusKm: 40, gridSize: 4 }, // 16 celdas
+  // Grandes ciudades (CABA, Córdoba Capital, Rosario, etc.)
+  // ⚡ CABA mide ~17x20km, radio 12km es suficiente
+  large: { radiusKm: 12, gridSize: 3 }, // 9 celdas - radio preciso
+  // Ciudades medianas (Pilar, Moreno, La Plata, Bariloche, etc.)
+  medium: { radiusKm: 8, gridSize: 3 }, // 9 celdas
   // Ciudades pequeñas / localidades
-  small: { radiusKm: 8, gridSize: 4 }, // 16 celdas
+  small: { radiusKm: 5, gridSize: 2 }, // 4 celdas
   // Muy pequeñas / barrios específicos
-  tiny: { radiusKm: 4, gridSize: 3 }, // 9 celdas
+  tiny: { radiusKm: 3, gridSize: 2 }, // 4 celdas
 };
 
 /**
