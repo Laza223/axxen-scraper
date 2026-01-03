@@ -378,7 +378,7 @@ class LeadEnrichmentService {
     options: EnrichmentOptions = {}
   ): Promise<LeadContactData> {
     const startTime = Date.now();
-    const maxTime = options.maxTimeMs || 12000; // ⚡ Reducido a 12 segundos
+    const maxTime = options.maxTimeMs || 8000; // ⚡ OPTIMIZADO: 8 segundos máximo
 
     // Configuración por defecto
     const config: Required<EnrichmentOptions> = {
@@ -533,14 +533,14 @@ class LeadEnrichmentService {
         );
       }
 
-      // Esperar tareas iniciales (máximo 6 segundos)
-      await Promise.race([Promise.all(parallelTasks), this.sleep(6000)]);
+      // Esperar tareas iniciales (máximo 4 segundos) ⚡ OPTIMIZADO
+      await Promise.race([Promise.all(parallelTasks), this.sleep(4000)]);
 
-      // PASO 3: Scrape del website (ahora que tenemos la URL)
+      // PASO 3: Scrape del website (ahora que tenemos la URL) ⚡ OPTIMIZADO
       if (config.scrapeWebsite && result.websiteUrl) {
         const webData = await Promise.race([
           this.scrapeWebsite(result.websiteUrl),
-          this.sleep(5000).then(() => null),
+          this.sleep(3000).then(() => null), // ⚡ Reducido a 3s
         ]);
 
         if (webData) {

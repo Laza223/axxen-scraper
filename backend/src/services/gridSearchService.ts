@@ -126,6 +126,7 @@ export function calculateBoundingBox(
 
 /**
  * Divide un bounding box en una grilla de celdas
+ * 🆕 MEJORADO: Ordena las celdas por proximidad al centro (mayor densidad primero)
  */
 export function createGrid(bbox: BoundingBox, gridSize: number): GridCell[] {
   const cells: GridCell[] = [];
@@ -142,6 +143,10 @@ export function createGrid(bbox: BoundingBox, gridSize: number): GridCell[] {
     2;
   const zoom = calculateZoomFromDistance(cellSizeKm);
 
+  // Centro del bounding box (donde hay mayor densidad de negocios)
+  const centerLat = (bbox.north + bbox.south) / 2;
+  const centerLng = (bbox.east + bbox.west) / 2;
+
   for (let row = 0; row < gridSize; row++) {
     for (let col = 0; col < gridSize; col++) {
       const cellLat = bbox.south + latStep * (row + 0.5);
@@ -154,6 +159,20 @@ export function createGrid(bbox: BoundingBox, gridSize: number): GridCell[] {
       });
     }
   }
+
+  // 🆕 PRIORIZACIÓN: Ordenar celdas por distancia al centro
+  // Las celdas más cercanas al centro tienen mayor densidad de negocios
+  cells.sort((a, b) => {
+    const distA = Math.sqrt(
+      Math.pow(a.center.lat - centerLat, 2) +
+        Math.pow(a.center.lng - centerLng, 2)
+    );
+    const distB = Math.sqrt(
+      Math.pow(b.center.lat - centerLat, 2) +
+        Math.pow(b.center.lng - centerLng, 2)
+    );
+    return distA - distB;
+  });
 
   return cells;
 }

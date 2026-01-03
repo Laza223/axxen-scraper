@@ -1,5 +1,6 @@
 import puppeteer, { Browser, Page } from "puppeteer";
 import antiDetection from "./antiDetection";
+import { browserPool } from "./browserPool";
 import businessCategorizationService from "./businessCategorizationService";
 import cacheService from "./cacheService";
 import duplicateDetectionService from "./duplicateDetectionService";
@@ -18,6 +19,7 @@ import retryQueueService from "./retryQueueService";
 import { googleMapsCircuitBreaker, withRetry } from "./retryService";
 import scraperMetrics from "./scraperMetrics";
 import synonymService from "./synonymService";
+import zoneSaturationService from "./zoneSaturationService";
 
 // Configuración avanzada
 const CONFIG = {
@@ -328,6 +330,7 @@ export interface ScrapeStats {
 
 class GoogleMapsScraper {
   private browser: Browser | null = null;
+  private currentInstanceId: string | null = null; // 🆕 Para el browserPool
   private currentKeyword: string = "";
   private sessionUserAgent: string = "";
   private sessionResolution: { width: number; height: number } = {
@@ -511,62 +514,94 @@ class GoogleMapsScraper {
 
   /**
    * Iniciar el navegador con configuración anti-detección
+   * 🆕 MEJORADO: Usa browserPool para reutilizar navegadores
    */
   async init(): Promise<void> {
     if (this.browser) return;
 
-    logger.info("🚀 Iniciando navegador Puppeteer con anti-detección...");
+    logger.info("🚀 Inicializando navegador desde browserPool...");
 
-    // Generar configuración aleatoria para la sesión
-    this.sessionUserAgent = antiDetection.getRandomUserAgent();
-    this.sessionResolution = antiDetection.getRandomResolution();
+    try {
+      // 🆕 Usar el browserPool para obtener un navegador reutilizable
+      await browserPool.initialize();
 
-    const proxy = antiDetection.getRandomProxy();
-    const launchArgs = [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-accelerated-2d-canvas",
-      "--disable-gpu",
-      `--window-size=${this.sessionResolution.width},${this.sessionResolution.height}`,
-      "--lang=es-AR",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-infobars",
-      "--disable-extensions",
-      "--disable-plugins",
-      "--disable-popup-blocking",
-      "--ignore-certificate-errors",
-      "--no-first-run",
-      "--no-default-browser-check",
-    ];
+      const { browser, instanceId, userAgent } = await browserPool.acquire();
 
-    // Agregar proxy si está configurado
-    if (proxy) {
-      launchArgs.push(
-        `--proxy-server=${antiDetection.formatProxyForPuppeteer(proxy)}`
+      this.browser = browser;
+      this.currentInstanceId = instanceId;
+      this.sessionUserAgent = userAgent;
+      this.sessionResolution = antiDetection.getRandomResolution();
+
+      logger.info(
+        `✅ Navegador obtenido del pool (${instanceId}) | UA: ${this.sessionUserAgent.substring(
+          0,
+          50
+        )}...`
       );
-      logger.info(`🔄 Usando proxy: ${proxy.host}:${proxy.port}`);
+    } catch (error) {
+      logger.warn(
+        `⚠️ browserPool falló, usando fallback: ${(error as Error).message}`
+      );
+
+      // Fallback: crear navegador directamente
+      this.sessionUserAgent = antiDetection.getRandomUserAgent();
+      this.sessionResolution = antiDetection.getRandomResolution();
+
+      const proxy = antiDetection.getRandomProxy();
+      const launchArgs = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-accelerated-2d-canvas",
+        "--disable-gpu",
+        `--window-size=${this.sessionResolution.width},${this.sessionResolution.height}`,
+        "--lang=es-AR",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-infobars",
+        "--disable-extensions",
+        "--disable-plugins",
+        "--disable-popup-blocking",
+        "--ignore-certificate-errors",
+        "--no-first-run",
+        "--no-default-browser-check",
+      ];
+
+      if (proxy) {
+        launchArgs.push(
+          `--proxy-server=${antiDetection.formatProxyForPuppeteer(proxy)}`
+        );
+      }
+
+      this.browser = await puppeteer.launch({
+        headless: "new",
+        args: launchArgs,
+        defaultViewport: this.sessionResolution,
+      });
+
+      this.currentInstanceId = null; // No es del pool
+      logger.info(`✅ Navegador fallback iniciado`);
     }
-
-    this.browser = await puppeteer.launch({
-      headless: "new",
-      args: launchArgs,
-      defaultViewport: this.sessionResolution,
-    });
-
-    logger.info(
-      `✅ Navegador iniciado | UA: ${this.sessionUserAgent.substring(0, 50)}...`
-    );
   }
 
   /**
-   * Cerrar el navegador
+   * Cerrar/liberar el navegador
+   * 🆕 MEJORADO: Libera al pool en lugar de cerrar
    */
   async close(): Promise<void> {
     if (this.browser) {
-      await this.browser.close();
+      if (this.currentInstanceId) {
+        // 🆕 Si viene del pool, solo liberarlo (no cerrarlo)
+        await browserPool.release(this.currentInstanceId);
+        logger.info(
+          `🔄 Navegador liberado al pool (${this.currentInstanceId})`
+        );
+      } else {
+        // Si es fallback, cerrarlo normalmente
+        await this.browser.close();
+        logger.info("🔒 Navegador fallback cerrado");
+      }
       this.browser = null;
-      logger.info("🔒 Navegador cerrado");
+      this.currentInstanceId = null;
     }
   }
 
@@ -819,28 +854,52 @@ class GoogleMapsScraper {
             `   ↳ Encontrados ${scrolledPlaces.length} lugares en celda ${cell.label}`
           );
 
-          // Obtener detalles de cada lugar nuevo
+          // 🆕 PARALELIZADO: Filtrar URLs nuevas primero
+          const newPlaceUrls: { url: string; placeId: string }[] = [];
           for (const placeUrl of scrolledPlaces) {
-            if (allPlaces.length >= maxResults) break;
+            if (allPlaces.length + newPlaceUrls.length >= maxResults) break;
 
-            // Extraer placeId de la URL para evitar duplicados
             const placeIdMatch = placeUrl.match(/!1s([^!]+)/);
             const placeId = placeIdMatch ? placeIdMatch[1] : placeUrl;
 
-            if (seenPlaceIds.has(placeId)) {
-              continue;
+            if (!seenPlaceIds.has(placeId)) {
+              seenPlaceIds.add(placeId);
+              newPlaceUrls.push({ url: placeUrl, placeId });
             }
-            seenPlaceIds.add(placeId);
+          }
 
-            try {
-              const details = await this.getPlaceDetails(
-                page,
-                placeUrl,
-                allPlaces.length + 1,
-                maxResults
-              );
+          // 🆕 PARALELIZADO: Procesar lugares en batches de 3
+          const BATCH_SIZE = 3;
+          for (
+            let batch = 0;
+            batch < newPlaceUrls.length;
+            batch += BATCH_SIZE
+          ) {
+            if (allPlaces.length >= maxResults) break;
 
-              if (details) {
+            const batchUrls = newPlaceUrls.slice(batch, batch + BATCH_SIZE);
+
+            // Procesar batch en paralelo
+            const batchResults = await Promise.all(
+              batchUrls.map(async ({ url: placeUrl }, batchIndex) => {
+                try {
+                  const details = await this.getPlaceDetails(
+                    page,
+                    placeUrl,
+                    allPlaces.length + batchIndex + 1,
+                    maxResults
+                  );
+                  return { details, placeUrl, success: true };
+                } catch (error: any) {
+                  logger.warn(`⚠️ Error en lugar: ${error.message}`);
+                  return { details: null, placeUrl, success: false };
+                }
+              })
+            );
+
+            // Agregar resultados exitosos
+            for (const { details, placeUrl } of batchResults) {
+              if (details && allPlaces.length < maxResults) {
                 allPlaces.push(details);
                 scraperMetrics.recordRequest({
                   url: placeUrl,
@@ -854,10 +913,11 @@ class GoogleMapsScraper {
                   relevanceScore: details.relevanceScore,
                 });
               }
+            }
 
-              await this.humanSleep(300, 800);
-            } catch (error: any) {
-              logger.warn(`⚠️ Error en lugar: ${error.message}`);
+            // Pequeño delay entre batches
+            if (batch + BATCH_SIZE < newPlaceUrls.length) {
+              await this.humanSleep(200, 400);
             }
           }
 
@@ -1013,6 +1073,27 @@ class GoogleMapsScraper {
           `C:${qualitySummary.gradeDistribution.C} D:${qualitySummary.gradeDistribution.D} F:${qualitySummary.gradeDistribution.F}`
       );
       scraperMetrics.logDetailedSummary();
+
+      // 🆕 CHEQUEO DE SATURACIÓN DE ZONA
+      const duplicatesRemoved = allPlaces.length - processedPlaces.length;
+      const saturationResult = zoneSaturationService.checkSaturation(
+        keyword,
+        location,
+        processedPlaces.length,
+        duplicatesRemoved + seenPlaceIds.size - allPlaces.length // Duplicados totales
+      );
+
+      if (saturationResult.isSaturated) {
+        logger.warn(`\n${saturationResult.recommendation}`);
+        if (
+          saturationResult.suggestedZones &&
+          saturationResult.suggestedZones.length > 0
+        ) {
+          logger.info(
+            `💡 Zonas sugeridas: ${saturationResult.suggestedZones.join(", ")}`
+          );
+        }
+      }
 
       return processedPlaces;
     } catch (error: any) {

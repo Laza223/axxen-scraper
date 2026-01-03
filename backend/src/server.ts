@@ -14,10 +14,13 @@ import browserPool from "./services/browserPool";
 import cacheService from "./services/cacheService";
 import crmExportService from "./services/crmExportService";
 import leadEnrichmentService from "./services/leadEnrichmentService";
+import leadVerificationService from "./services/leadVerificationService";
 import logger from "./services/logger";
 import placesService from "./services/placesService";
 import premiumAlertService from "./services/premiumAlertService";
+import queueService from "./services/queueService";
 import techStackDetector from "./services/techStackDetector";
+import zoneSaturationService from "./services/zoneSaturationService";
 
 const prisma = new PrismaClient();
 const app = express();
@@ -1406,6 +1409,226 @@ app.get("/api/browser-pool/stats", (req: Request, res: Response) => {
   res.json(stats);
 });
 
+// ==================== QUEUE ENDPOINTS ====================
+
+/**
+ * 📥 Encolar una búsqueda para procesamiento en background
+ */
+app.post("/api/queue/search", async (req: Request, res: Response) => {
+  try {
+    const { keyword, location, maxResults } = req.body;
+
+    if (!keyword || !location) {
+      res.status(400).json({
+        success: false,
+        error: "keyword y location son requeridos",
+      });
+      return;
+    }
+
+    const jobId = await queueService.enqueueSearch({
+      keyword,
+      location,
+      maxResults: maxResults || 50,
+    });
+
+    res.json({
+      success: true,
+      jobId,
+      message: "Búsqueda encolada correctamente",
+      status: "waiting",
+    });
+  } catch (error) {
+    logger.error(`Error al encolar búsqueda: ${error}`);
+    res.status(500).json({ success: false, error: "Error al encolar" });
+  }
+});
+
+/**
+ * 📊 Estado de un job específico
+ */
+app.get("/api/queue/status/:jobId", async (req: Request, res: Response) => {
+  try {
+    const { jobId } = req.params;
+    const status = await queueService.getJobStatus(jobId);
+
+    if (!status) {
+      res.status(404).json({ success: false, error: "Job no encontrado" });
+      return;
+    }
+
+    res.json({ success: true, ...status });
+  } catch (error) {
+    logger.error(`Error al obtener estado: ${error}`);
+    res.status(500).json({ success: false, error: "Error al obtener estado" });
+  }
+});
+
+/**
+ * 📈 Estadísticas generales de la cola
+ */
+app.get("/api/queue/stats", async (req: Request, res: Response) => {
+  try {
+    const stats = await queueService.getStats();
+    res.json({ success: true, ...stats });
+  } catch (error) {
+    logger.error(`Error al obtener estadísticas: ${error}`);
+    res.status(500).json({ success: false, error: "Error al obtener stats" });
+  }
+});
+
+/**
+ * 🔍 Lista de jobs activos
+ */
+app.get("/api/queue/active", async (req: Request, res: Response) => {
+  try {
+    const jobs = await queueService.getActiveJobs();
+    res.json({ success: true, jobs });
+  } catch (error) {
+    logger.error(`Error al obtener jobs activos: ${error}`);
+    res.status(500).json({ success: false, error: "Error al obtener jobs" });
+  }
+});
+
+/**
+ * ❌ Cancelar un job
+ */
+app.delete("/api/queue/job/:jobId", async (req: Request, res: Response) => {
+  try {
+    const { jobId } = req.params;
+    const cancelled = await queueService.cancelJob(jobId);
+
+    if (!cancelled) {
+      res
+        .status(404)
+        .json({ success: false, error: "Job no encontrado o ya completado" });
+      return;
+    }
+
+    res.json({ success: true, message: "Job cancelado" });
+  } catch (error) {
+    logger.error(`Error al cancelar job: ${error}`);
+    res.status(500).json({ success: false, error: "Error al cancelar" });
+  }
+});
+
+/**
+ * 🧹 Limpiar jobs completados
+ */
+app.post("/api/queue/cleanup", async (req: Request, res: Response) => {
+  try {
+    await queueService.cleanup();
+    res.json({ success: true, message: "Cola limpiada" });
+  } catch (error) {
+    logger.error(`Error al limpiar cola: ${error}`);
+    res.status(500).json({ success: false, error: "Error al limpiar" });
+  }
+});
+
+// ==================== VERIFICATION ENDPOINTS ====================
+
+/**
+ * ✅ Verificar un lead individual
+ */
+app.post("/api/leads/verify", async (req: Request, res: Response) => {
+  try {
+    const lead = req.body;
+
+    if (!lead.name) {
+      res.status(400).json({
+        success: false,
+        error: "Se requiere al menos el nombre del lead",
+      });
+      return;
+    }
+
+    const result = await leadVerificationService.verifyLead(lead);
+    res.json({ success: true, verification: result });
+  } catch (error) {
+    logger.error(`Error al verificar lead: ${error}`);
+    res.status(500).json({ success: false, error: "Error al verificar" });
+  }
+});
+
+/**
+ * ✅✅ Verificar múltiples leads en batch
+ */
+app.post("/api/leads/verify-batch", async (req: Request, res: Response) => {
+  try {
+    const { leads } = req.body;
+
+    if (!Array.isArray(leads) || leads.length === 0) {
+      res.status(400).json({
+        success: false,
+        error: "Se requiere un array de leads",
+      });
+      return;
+    }
+
+    if (leads.length > 100) {
+      res.status(400).json({
+        success: false,
+        error: "Máximo 100 leads por batch",
+      });
+      return;
+    }
+
+    const resultsMap = await leadVerificationService.verifyLeads(leads);
+
+    // Convertir Map a array para estadísticas
+    const resultsArray = Array.from(resultsMap.values());
+    const resultsObject = Object.fromEntries(resultsMap);
+
+    // Estadísticas del batch
+    const stats = {
+      total: resultsArray.length,
+      gradeA: resultsArray.filter((r) => r.confidenceGrade === "A").length,
+      gradeB: resultsArray.filter((r) => r.confidenceGrade === "B").length,
+      gradeC: resultsArray.filter((r) => r.confidenceGrade === "C").length,
+      gradeD: resultsArray.filter((r) => r.confidenceGrade === "D").length,
+      gradeF: resultsArray.filter((r) => r.confidenceGrade === "F").length,
+      averageScore:
+        resultsArray.length > 0
+          ? Math.round(
+              resultsArray.reduce((sum, r) => sum + r.confidenceScore, 0) /
+                resultsArray.length
+            )
+          : 0,
+    };
+
+    res.json({ success: true, results: resultsObject, stats });
+  } catch (error) {
+    logger.error(`Error al verificar leads: ${error}`);
+    res.status(500).json({ success: false, error: "Error al verificar batch" });
+  }
+});
+
+// ==================== ZONE SATURATION ENDPOINTS ====================
+
+/**
+ * 🗺️ Resumen de saturación de todas las zonas
+ */
+app.get("/api/zones/summary", (req: Request, res: Response) => {
+  const summary = zoneSaturationService.getSummary();
+  res.json({ success: true, ...summary });
+});
+
+/**
+ * 🧹 Limpiar métricas antiguas de zonas
+ */
+app.post("/api/zones/cleanup", (req: Request, res: Response) => {
+  zoneSaturationService.cleanup();
+  res.json({ success: true, message: "Métricas de zonas limpiadas" });
+});
+
+/**
+ * 🔄 Resetear todas las métricas de zonas
+ */
+app.post("/api/zones/reset", (req: Request, res: Response) => {
+  zoneSaturationService.reset();
+  res.json({ success: true, message: "Métricas de zonas reseteadas" });
+});
+
 // ==================== ERROR HANDLERS ====================
 
 // 404
@@ -1428,7 +1651,7 @@ app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
 
 // ==================== INICIAR SERVIDOR ====================
 
-const server = app.listen(port, () => {
+const server = app.listen(port, async () => {
   logger.info("=".repeat(50));
   logger.info("🚀 Lead Scraper v3.0 - Puppeteer Edition");
   logger.info("=".repeat(50));
@@ -1436,11 +1659,66 @@ const server = app.listen(port, () => {
   logger.info(`💰 Modo: GRATIS (sin API key)`);
   logger.info(`🔧 Motor: Puppeteer + Google Maps Scraping`);
   logger.info("=".repeat(50));
+
+  // Inicializar sistema de colas
+  try {
+    // Registrar el procesador de búsquedas
+    queueService.registerProcessor(async (job) => {
+      const { keyword, location, maxResults } = job.data;
+      const startTime = Date.now();
+
+      logger.info(
+        `📥 Procesando búsqueda en cola: "${keyword}" en "${location}"`
+      );
+
+      const result = await placesService.searchPlaces({
+        keyword,
+        location,
+        maxResults: maxResults || 50,
+      });
+
+      // Verificar leads automáticamente si hay resultados
+      if (result.leads && result.leads.length > 0) {
+        const verificationsMap = await leadVerificationService.verifyLeads(
+          result.leads
+        );
+        const verificationsArray = Array.from(verificationsMap.values());
+        const avgScore =
+          verificationsArray.length > 0
+            ? Math.round(
+                verificationsArray.reduce(
+                  (sum, v) => sum + v.confidenceScore,
+                  0
+                ) / verificationsArray.length
+              )
+            : 0;
+        logger.info(
+          `✅ Verificados ${verificationsArray.length} leads - Score promedio: ${avgScore}`
+        );
+      }
+
+      const duration = Date.now() - startTime;
+
+      return {
+        success: result.success,
+        placesFound: result.leads.length,
+        places: result.leads,
+        duration,
+      };
+    });
+
+    await queueService.initialize();
+    logger.info("📋 Sistema de colas Bull inicializado");
+  } catch (error) {
+    logger.warn(`⚠️ Cola Bull no disponible (Redis offline?): ${error}`);
+    logger.info("💡 El servidor funcionará sin colas en background");
+  }
 });
 
 // Graceful shutdown
 process.on("SIGTERM", async () => {
   logger.info("🛑 Apagando servidor...");
+  await queueService.close();
   await browserPool.shutdown();
   await placesService.shutdown();
   server.close(() => {
@@ -1451,6 +1729,7 @@ process.on("SIGTERM", async () => {
 
 process.on("SIGINT", async () => {
   logger.info("🛑 Apagando servidor...");
+  await queueService.close();
   await browserPool.shutdown();
   await placesService.shutdown();
   server.close(() => {
