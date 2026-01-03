@@ -1,22 +1,29 @@
 import puppeteer, { Browser, Page } from "puppeteer";
 import antiDetection from "./antiDetection";
+import businessCategorizationService from "./businessCategorizationService";
 import cacheService from "./cacheService";
+import duplicateDetectionService from "./duplicateDetectionService";
 import {
   buildGridSearchUrl,
   calculateBoundingBox,
   createGrid,
+  estimateCitySize,
   extractCoordsFromUrl,
   generateGridConfig,
+  gridSearchService,
 } from "./gridSearchService";
+import leadQualityScoringService from "./leadQualityScoringService";
 import logger from "./logger";
+import retryQueueService from "./retryQueueService";
 import { googleMapsCircuitBreaker, withRetry } from "./retryService";
 import scraperMetrics from "./scraperMetrics";
+import synonymService from "./synonymService";
 
 // Configuración avanzada
 const CONFIG = {
   HEADLESS: true, // true = sin ventana, false = ver el navegador
-  TIMEOUT: 30000,
-  MAX_SCROLL_ATTEMPTS: 20, // Más intentos para zonas con muchos resultados
+  TIMEOUT: 45000, // ⬆️ Aumentado para provincias grandes
+  MAX_SCROLL_ATTEMPTS: 50, // ⬆️ Más intentos para zonas con muchos resultados
   MAX_CONCURRENT_TABS: 3, // Tabs paralelas para detalles
   RETRY_ATTEMPTS: 3,
   ENABLE_GRID_SEARCH: true, // Habilitar búsqueda por grilla para cubrir toda el área
@@ -38,6 +45,66 @@ const SOCIAL_MEDIA_DOMAINS = [
   "t.me",
   "telegram.org",
   "pinterest.com",
+];
+
+// Dominios de directorios/plataformas que NO cuentan como website propio
+const DIRECTORY_DOMAINS = [
+  // Directorios internacionales
+  "yelp.com",
+  "tripadvisor.com",
+  "foursquare.com",
+  "trustpilot.com",
+  "yellowpages.com",
+  "manta.com",
+  "hotfrog.com",
+  // Inmobiliarias Argentina
+  "argenprop.com",
+  "zonaprop.com",
+  "properati.com.ar",
+  "inmuebles.clarin.com",
+  "remax.com.ar",
+  "century21.com.ar",
+  "inmobusqueda.com.ar",
+  "cabaprop.com.ar",
+  "mudafy.com.ar",
+  // Clasificados
+  "mercadolibre.com.ar",
+  "mercadolibre.com",
+  "olx.com.ar",
+  "olx.com",
+  "alamaula.com",
+  "segundamano.com",
+  // Gastronómicos
+  "restorando.com.ar",
+  "pedidosya.com",
+  "rappi.com.ar",
+  "glovo.com",
+  // Salud
+  "doctoralia.com.ar",
+  // Autos
+  "autocosmos.com.ar",
+  "demotores.com.ar",
+  "kavak.com",
+  // Directorios genéricos
+  "paginasamarillas.com",
+  "paginasamarillas.com.ar",
+  "guiaoleo.com.ar",
+  "cylex.com.ar",
+  "infobel.com",
+  "tupalo.com",
+  "locanto.com.ar",
+  // Plataformas de webs gratuitas (no son web propias)
+  "wix.com",
+  "weebly.com",
+  "sites.google.com",
+  "wordpress.com",
+  "blogspot.com",
+  "tumblr.com",
+  "carrd.co",
+  "linktree.com",
+  "linktr.ee",
+  "bio.link",
+  "beacons.ai",
 ];
 
 // Sinónimos de categorías para filtrar relevancia
@@ -218,6 +285,13 @@ export interface ScrapedPlace {
   instagramUrl?: string;
   facebookUrl?: string;
   whatsappNumber?: string;
+  // 🆕 Campos de calidad y categorización
+  qualityScore?: number; // 0-100 score de calidad del lead
+  qualityGrade?: "A" | "B" | "C" | "D" | "F"; // Calificación
+  businessSize?: "franchise" | "chain" | "local" | "independent" | "unknown";
+  businessType?: string; // Tipo de negocio detectado
+  chainName?: string; // Nombre de la cadena si es franquicia
+  searchCity?: string; // 🆕 Ciudad donde se encontró (para búsquedas provinciales)
 }
 
 export interface ScrapeOptions {
@@ -229,6 +303,13 @@ export interface ScrapeOptions {
   concurrentTabs?: number; // Tabs paralelas
   strictMatch?: boolean; // Solo resultados con coincidencia exacta (sin categorías relacionadas)
   forceRefresh?: boolean; // Ignorar caché y hacer scraping nuevo
+  // 🆕 Nuevas opciones
+  useSynonyms?: boolean; // Usar sinónimos para expandir búsqueda
+  deduplicateResults?: boolean; // Deduplicar resultados inteligentemente
+  calculateQualityScore?: boolean; // Calcular score de calidad
+  categorizeBusinesses?: boolean; // Categorizar tipo de negocio
+  excludeFranchises?: boolean; // Excluir franquicias conocidas
+  minQualityScore?: number; // Score mínimo de calidad (0-100)
 }
 
 export interface ScrapeStats {
@@ -239,6 +320,10 @@ export interface ScrapeStats {
   withSocialMedia: number;
   avgRelevance: number;
   duration: number;
+  // 🆕 Nuevas estadísticas
+  duplicatesRemoved?: number;
+  averageQualityScore?: number;
+  byBusinessSize?: Record<string, number>;
 }
 
 class GoogleMapsScraper {
@@ -257,6 +342,41 @@ class GoogleMapsScraper {
     if (!url) return false;
     const lowerUrl = url.toLowerCase();
     return SOCIAL_MEDIA_DOMAINS.some((domain) => lowerUrl.includes(domain));
+  }
+
+  /**
+   * Verificar si una URL es de un directorio/plataforma (no es website propio)
+   */
+  private isDirectoryUrl(url: string): boolean {
+    if (!url) return false;
+    const lowerUrl = url.toLowerCase();
+    return DIRECTORY_DOMAINS.some((domain) => lowerUrl.includes(domain));
+  }
+
+  /**
+   * Verificar si una URL es un website REAL del negocio
+   * Debe tener dominio propio, no ser red social ni directorio
+   */
+  private isRealBusinessWebsite(url: string): boolean {
+    if (!url) return false;
+
+    // No es red social
+    if (this.isSocialMediaUrl(url)) return false;
+
+    // No es directorio/plataforma
+    if (this.isDirectoryUrl(url)) return false;
+
+    // Tiene que ser una URL válida
+    try {
+      const urlObj = new URL(url);
+      // Debe tener un dominio real (no localhost, no IP)
+      if (urlObj.hostname === "localhost") return false;
+      if (/^\d+\.\d+\.\d+\.\d+$/.test(urlObj.hostname)) return false;
+
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -412,6 +532,12 @@ class GoogleMapsScraper {
       "--lang=es-AR",
       "--disable-blink-features=AutomationControlled",
       "--disable-infobars",
+      "--disable-extensions",
+      "--disable-plugins",
+      "--disable-popup-blocking",
+      "--ignore-certificate-errors",
+      "--no-first-run",
+      "--no-default-browser-check",
     ];
 
     // Agregar proxy si está configurado
@@ -452,7 +578,7 @@ class GoogleMapsScraper {
     const {
       keyword,
       location,
-      maxResults = 40,
+      maxResults = 100,
       forceRefresh = false,
     } = options;
     const cacheKey = `scrape:${keyword}:${location}`.toLowerCase();
@@ -494,6 +620,15 @@ class GoogleMapsScraper {
     const seenPlaceIds = new Set<string>();
 
     try {
+      // Event handler para detectar si la página se cierra
+      page.on("close", () => {
+        logger.warn("⚠️ La página fue cerrada inesperadamente");
+      });
+
+      page.on("error", (err) => {
+        logger.error(`❌ Error en la página: ${err.message}`);
+      });
+
       // Configuración anti-detección
       await page.setUserAgent(this.sessionUserAgent);
       await page.setExtraHTTPHeaders(antiDetection.getRandomHeaders());
@@ -538,14 +673,53 @@ class GoogleMapsScraper {
       await this.acceptCookies(page);
 
       // Esperar a que se cargue y obtener coordenadas de la URL
-      await this.sleep(2000);
+      await this.sleep(3000); // Más tiempo para que cargue
+
+      // Verificar si hay bloqueo o CAPTCHA
+      const pageContent = await page.content();
+      if (
+        pageContent.includes("unusual traffic") ||
+        pageContent.includes("captcha") ||
+        pageContent.includes("sorry")
+      ) {
+        logger.warn("⚠️ Google detectó tráfico inusual, esperando...");
+        await this.sleep(10000); // Esperar 10 segundos
+        await page.reload({ waitUntil: "networkidle2" });
+        await this.sleep(3000);
+      }
+
       const currentUrl = page.url();
+      logger.debug(`📍 URL actual: ${currentUrl}`);
       const centerCoords = extractCoordsFromUrl(currentUrl);
+
+      // 🆕 Detectar si es una búsqueda provincial/regional
+      const locationSize = estimateCitySize(location);
+      const isProvincialSearch =
+        locationSize === "province" || locationSize === "region";
+
+      if (isProvincialSearch) {
+        logger.info(
+          `🗺️ Detectada búsqueda PROVINCIAL/REGIONAL: ${locationSize}`
+        );
+        // Usar búsqueda por ciudades principales
+        return this.scrapeProvincial(
+          page,
+          options,
+          allPlaces,
+          seenPlaceIds,
+          startTime,
+          cacheKey
+        );
+      }
 
       if (!centerCoords) {
         logger.warn(
           "⚠️ No se pudieron extraer coordenadas, usando búsqueda simple"
         );
+
+        // Esperar un poco más antes del fallback
+        await this.sleep(2000);
+
         // Fallback a búsqueda simple si no hay coordenadas
         return this.scrapeSimple(
           page,
@@ -565,12 +739,21 @@ class GoogleMapsScraper {
 
       // PASO 2: Generar grilla de búsqueda dinámica
       const gridConfig = generateGridConfig(location);
-      logger.info(
-        `🗺️ Generando grilla ${gridConfig.gridSize}x${gridConfig.gridSize} (radio: ${gridConfig.radiusKm}km)`
-      );
-
       const bbox = calculateBoundingBox(centerCoords, gridConfig.radiusKm);
       const gridCells = createGrid(bbox, gridConfig.gridSize);
+
+      logger.info(
+        `🗺️ Grilla ${gridConfig.gridSize}x${gridConfig.gridSize} = ${gridCells.length} celdas | ` +
+          `Radio: ${gridConfig.radiusKm}km | ` +
+          `Área: ${(gridConfig.radiusKm * 2).toFixed(0)}km x ${(
+            gridConfig.radiusKm * 2
+          ).toFixed(0)}km`
+      );
+      logger.info(
+        `📍 Cubriendo desde (${bbox.south.toFixed(4)}, ${bbox.west.toFixed(
+          4
+        )}) ` + `hasta (${bbox.north.toFixed(4)}, ${bbox.east.toFixed(4)})`
+      );
 
       logger.info(
         `🔍 [2/2] Buscando en ${gridCells.length} celdas de la grilla...`
@@ -586,35 +769,51 @@ class GoogleMapsScraper {
         const cellUrl = buildGridSearchUrl(keyword, cell);
 
         logger.info(
-          `📍 [${i + 1}/${gridCells.length}] Celda ${cell.label} - zoom ${
-            cell.zoom
-          }`
+          `📍 [${i + 1}/${gridCells.length}] Celda ${
+            cell.label
+          } (${cell.center.lat.toFixed(4)}, ${cell.center.lng.toFixed(
+            4
+          )}) - zoom ${cell.zoom}`
         );
 
         try {
+          // Navegar a las coordenadas de la celda
           await page.goto(cellUrl, {
             waitUntil: "networkidle2",
             timeout: CONFIG.TIMEOUT,
           });
 
-          await this.humanSleep(1000, 2000);
+          await this.humanSleep(1500, 2500);
+
+          // 🆕 Mover el mapa ligeramente y presionar "Buscar en esta área"
+          // Esto fuerza a Google a cargar resultados de la nueva ubicación
+          const searchInAreaSuccess = await this.moveMapAndSearch(
+            page,
+            cell.center.lat,
+            cell.center.lng,
+            keyword
+          );
+
+          if (searchInAreaSuccess) {
+            logger.debug(`   ↳ "Buscar en esta área" ejecutado exitosamente`);
+          }
 
           // Esperar el panel de resultados
           await page
-            .waitForSelector('div[role="feed"]', { timeout: 8000 })
+            .waitForSelector('div[role="feed"]', { timeout: 10000 })
             .catch(() => {});
 
-          // Scroll y recolectar
+          // Scroll y recolectar (ahora con más resultados esperados)
           const cellMaxResults =
             Math.ceil(
               (maxResults - allPlaces.length) / (gridCells.length - i)
-            ) + 5;
+            ) + 10; // +10 en lugar de +5 para aprovechar el "Buscar en esta área"
           const scrolledPlaces = await this.scrollAndCollect(
             page,
             cellMaxResults
           );
 
-          logger.debug(
+          logger.info(
             `   ↳ Encontrados ${scrolledPlaces.length} lugares en celda ${cell.label}`
           );
 
@@ -675,39 +874,503 @@ class GoogleMapsScraper {
         googleMapsCircuitBreaker.recordSuccess();
       }
 
-      // Filtrar por relevancia si strictMatch está activado
-      let filteredPlaces = allPlaces;
+      // 🆕 POST-PROCESAMIENTO AVANZADO
+      let processedPlaces = allPlaces;
+
+      // 1. Deduplicación inteligente
+      if (options.deduplicateResults !== false) {
+        const dedupeResult =
+          duplicateDetectionService.deduplicate(processedPlaces);
+        if (dedupeResult.stats.removed > 0) {
+          logger.info(
+            `🔍 Deduplicación: ${dedupeResult.stats.removed} duplicados removidos`
+          );
+        }
+        processedPlaces = dedupeResult.unique;
+      }
+
+      // 2. Calcular score de calidad para cada lugar
+      if (options.calculateQualityScore !== false) {
+        processedPlaces = processedPlaces.map((place) => {
+          const scoreResult = leadQualityScoringService.calculateScore({
+            name: place.name,
+            website: place.website,
+            hasRealWebsite: place.hasRealWebsite,
+            email: place.email,
+            phone: place.phone,
+            address: place.address,
+            rating: place.rating,
+            reviewCount: place.reviewCount,
+            instagramUrl: place.instagramUrl,
+            facebookUrl: place.facebookUrl,
+            businessHours: place.businessHours,
+          });
+          return {
+            ...place,
+            qualityScore: scoreResult.score,
+            qualityGrade: scoreResult.grade,
+          };
+        });
+      }
+
+      // 3. Categorizar tipo de negocio
+      if (options.categorizeBusinesses !== false) {
+        processedPlaces = processedPlaces.map((place) => {
+          const catResult = businessCategorizationService.categorize({
+            name: place.name,
+            category: place.category,
+            address: place.address,
+            website: place.website,
+            phone: place.phone,
+            reviewCount: place.reviewCount,
+            rating: place.rating,
+          });
+          return {
+            ...place,
+            businessSize: catResult.businessSize,
+            businessType: catResult.businessType,
+            chainName: catResult.chainName,
+          };
+        });
+      }
+
+      // 4. Excluir franquicias si se solicita
+      if (options.excludeFranchises) {
+        const beforeCount = processedPlaces.length;
+        processedPlaces = processedPlaces.filter(
+          (p) => p.businessSize !== "franchise" && p.businessSize !== "chain"
+        );
+        if (processedPlaces.length < beforeCount) {
+          logger.info(
+            `🏢 Franquicias excluidas: ${beforeCount - processedPlaces.length}`
+          );
+        }
+      }
+
+      // 5. Filtrar por score mínimo de calidad
+      if (options.minQualityScore && options.minQualityScore > 0) {
+        const beforeCount = processedPlaces.length;
+        processedPlaces = processedPlaces.filter(
+          (p) => (p.qualityScore || 0) >= options.minQualityScore!
+        );
+        if (processedPlaces.length < beforeCount) {
+          logger.info(
+            `🏆 Filtro de calidad (min ${options.minQualityScore}): ${
+              beforeCount - processedPlaces.length
+            } excluidos`
+          );
+        }
+      }
+
+      // 6. Filtrar por relevancia si strictMatch está activado
       if (options.strictMatch) {
         const minRelevance = 60;
-        filteredPlaces = allPlaces.filter(
+        const beforeCount = processedPlaces.length;
+        processedPlaces = processedPlaces.filter(
           (p) => p.relevanceScore >= minRelevance
         );
 
-        if (filteredPlaces.length < allPlaces.length) {
+        if (processedPlaces.length < beforeCount) {
           logger.info(
             `🎯 Modo estricto: ${
-              allPlaces.length - filteredPlaces.length
+              beforeCount - processedPlaces.length
             } resultados filtrados por baja relevancia`
           );
         }
       }
 
+      // 7. Ordenar por calidad (mayor primero)
+      processedPlaces.sort(
+        (a, b) => (b.qualityScore || 0) - (a.qualityScore || 0)
+      );
+
       const totalDuration = Date.now() - startTime;
+
+      // Log resumen de calidad
+      const qualitySummary = leadQualityScoringService.getQualitySummary(
+        processedPlaces.map((p) => ({
+          name: p.name,
+          website: p.website,
+          hasRealWebsite: p.hasRealWebsite,
+          email: p.email,
+          phone: p.phone,
+          address: p.address,
+          rating: p.rating,
+          reviewCount: p.reviewCount,
+        }))
+      );
+
       logger.info(
-        `✅ Scraping por grilla completado: ${
-          filteredPlaces.length
-        } lugares en ${(totalDuration / 1000).toFixed(1)}s`
+        `✅ Scraping completado: ${processedPlaces.length} lugares en ${(
+          totalDuration / 1000
+        ).toFixed(1)}s`
+      );
+      logger.info(
+        `📊 Calidad promedio: ${qualitySummary.averageScore} | ` +
+          `A:${qualitySummary.gradeDistribution.A} B:${qualitySummary.gradeDistribution.B} ` +
+          `C:${qualitySummary.gradeDistribution.C} D:${qualitySummary.gradeDistribution.D} F:${qualitySummary.gradeDistribution.F}`
       );
       scraperMetrics.logDetailedSummary();
 
-      return filteredPlaces;
+      return processedPlaces;
     } catch (error: any) {
       logger.error(`❌ Error en scraping: ${error.message}`);
       googleMapsCircuitBreaker.recordFailure();
-      throw error;
+
+      // Devolver lo que tengamos en lugar de crashear
+      if (allPlaces.length > 0) {
+        logger.info(
+          `📦 Devolviendo ${allPlaces.length} lugares parciales a pesar del error`
+        );
+        return allPlaces;
+      }
+
+      // Si no tenemos nada, devolver array vacío en lugar de crashear
+      return [];
     } finally {
-      await page.close();
+      try {
+        if (page && !page.isClosed()) {
+          await page.close();
+        }
+      } catch {
+        // Ignorar errores al cerrar la página
+      }
     }
+  }
+
+  /**
+   * 🆕 Búsqueda expandida con sinónimos
+   * Realiza múltiples búsquedas con variantes del término y consolida resultados
+   */
+  async scrapePlacesWithSynonyms(
+    options: ScrapeOptions
+  ): Promise<ScrapedPlace[]> {
+    const { keyword, location, maxResults = 100 } = options;
+    const startTime = Date.now();
+
+    // Obtener sinónimos para el término de búsqueda
+    const synonyms = synonymService.getSynonyms(keyword);
+
+    // Limitar cantidad de variantes (máximo 4 para no demorar demasiado)
+    const searchTerms = synonyms.slice(0, 4);
+
+    if (searchTerms.length <= 1) {
+      // Sin sinónimos, hacer búsqueda normal
+      logger.info(`🔍 Búsqueda sin sinónimos: "${keyword}"`);
+      return this.scrapePlaces(options);
+    }
+
+    logger.info(
+      `🔄 Búsqueda expandida con ${
+        searchTerms.length
+      } variantes: ${searchTerms.join(", ")}`
+    );
+
+    const allResults: ScrapedPlace[] = [];
+    const seenPlaceIds = new Set<string>();
+    const resultsPerTerm = Math.ceil(maxResults / searchTerms.length);
+
+    // Realizar búsqueda por cada sinónimo
+    for (let i = 0; i < searchTerms.length; i++) {
+      const term = searchTerms[i];
+      logger.info(
+        `🔍 [${i + 1}/${searchTerms.length}] Buscando: "${term} en ${location}"`
+      );
+
+      try {
+        const results = await this.scrapePlaces({
+          ...options,
+          keyword: term,
+          maxResults: resultsPerTerm,
+          // Desactivar procesamiento individual, lo haremos al final
+          deduplicateResults: false,
+          calculateQualityScore: false,
+          categorizeBusinesses: false,
+        });
+
+        // Agregar solo los que no hemos visto
+        for (const place of results) {
+          if (!seenPlaceIds.has(place.placeId)) {
+            seenPlaceIds.add(place.placeId);
+            allResults.push(place);
+          }
+        }
+
+        logger.info(
+          `   ↳ Encontrados: ${results.length} (únicos totales: ${allResults.length})`
+        );
+
+        // Delay entre búsquedas
+        if (i < searchTerms.length - 1) {
+          await this.sleep(3000 + Math.random() * 2000);
+        }
+      } catch (error: any) {
+        logger.warn(`⚠️ Error en búsqueda "${term}": ${error.message}`);
+        // Agregar a cola de reintentos
+        retryQueueService.enqueue(
+          "grid_cell",
+          { keyword: term, location },
+          {
+            error: error.message,
+            priority: "normal",
+          }
+        );
+      }
+    }
+
+    // Aplicar post-procesamiento a todos los resultados
+    let processedPlaces = allResults;
+
+    // Deduplicación inteligente
+    const dedupeResult = duplicateDetectionService.deduplicate(processedPlaces);
+    if (dedupeResult.stats.removed > 0) {
+      logger.info(
+        `🔍 Deduplicación final: ${dedupeResult.stats.removed} duplicados removidos`
+      );
+    }
+    processedPlaces = dedupeResult.unique;
+
+    // Calcular score de calidad
+    processedPlaces = processedPlaces.map((place) => {
+      const scoreResult = leadQualityScoringService.calculateScore({
+        name: place.name,
+        website: place.website,
+        hasRealWebsite: place.hasRealWebsite,
+        email: place.email,
+        phone: place.phone,
+        address: place.address,
+        rating: place.rating,
+        reviewCount: place.reviewCount,
+        instagramUrl: place.instagramUrl,
+        facebookUrl: place.facebookUrl,
+        businessHours: place.businessHours,
+      });
+      return {
+        ...place,
+        qualityScore: scoreResult.score,
+        qualityGrade: scoreResult.grade,
+      };
+    });
+
+    // Categorizar negocios
+    processedPlaces = processedPlaces.map((place) => {
+      const catResult = businessCategorizationService.categorize({
+        name: place.name,
+        category: place.category,
+        address: place.address,
+        website: place.website,
+        phone: place.phone,
+        reviewCount: place.reviewCount,
+        rating: place.rating,
+      });
+      return {
+        ...place,
+        businessSize: catResult.businessSize,
+        businessType: catResult.businessType,
+        chainName: catResult.chainName,
+      };
+    });
+
+    // Excluir franquicias si se solicita
+    if (options.excludeFranchises) {
+      const beforeCount = processedPlaces.length;
+      processedPlaces = processedPlaces.filter(
+        (p) => p.businessSize !== "franchise" && p.businessSize !== "chain"
+      );
+      if (processedPlaces.length < beforeCount) {
+        logger.info(
+          `🏢 Franquicias excluidas: ${beforeCount - processedPlaces.length}`
+        );
+      }
+    }
+
+    // Filtrar por score mínimo
+    if (options.minQualityScore && options.minQualityScore > 0) {
+      const beforeCount = processedPlaces.length;
+      processedPlaces = processedPlaces.filter(
+        (p) => (p.qualityScore || 0) >= options.minQualityScore!
+      );
+      if (processedPlaces.length < beforeCount) {
+        logger.info(
+          `🏆 Filtro de calidad: ${
+            beforeCount - processedPlaces.length
+          } excluidos`
+        );
+      }
+    }
+
+    // Ordenar por calidad
+    processedPlaces.sort(
+      (a, b) => (b.qualityScore || 0) - (a.qualityScore || 0)
+    );
+
+    // Limitar a maxResults
+    if (processedPlaces.length > maxResults) {
+      processedPlaces = processedPlaces.slice(0, maxResults);
+    }
+
+    const totalDuration = Date.now() - startTime;
+    logger.info(
+      `✅ Búsqueda expandida completada: ${
+        processedPlaces.length
+      } lugares únicos en ${(totalDuration / 1000).toFixed(1)}s`
+    );
+
+    return processedPlaces;
+  }
+
+  /**
+   * 🆕 Scraping PROVINCIAL - busca en ciudades principales de la provincia
+   * Útil para búsquedas a nivel de provincia entera
+   */
+  private async scrapeProvincial(
+    page: Page,
+    options: ScrapeOptions,
+    places: ScrapedPlace[],
+    seenPlaceIds: Set<string>,
+    startTime: number,
+    cacheKey: string
+  ): Promise<ScrapedPlace[]> {
+    const { keyword, location, maxResults = 100 } = options;
+
+    // Obtener las ciudades a buscar usando el servicio de grilla
+    const gridSearch = await gridSearchService.prepareGridSearch(
+      keyword,
+      location,
+      {
+        maxCells: 30, // Máximo 30 ciudades para no exceder tiempos
+      }
+    );
+
+    logger.info(
+      `🏙️ Búsqueda provincial: ${gridSearch.urls.length} ciudades a buscar`
+    );
+
+    const allPlaces: ScrapedPlace[] = [...places];
+    let citiesSearched = 0;
+
+    // Buscar en cada ciudad
+    for (
+      let i = 0;
+      i < gridSearch.urls.length && allPlaces.length < maxResults;
+      i++
+    ) {
+      const cityUrl = gridSearch.urls[i];
+      const cityLabel = gridSearch.cells[i]?.label || `Ciudad ${i + 1}`;
+
+      logger.info(
+        `🏙️ [${i + 1}/${gridSearch.urls.length}] Buscando en: ${cityLabel}`
+      );
+
+      try {
+        // Navegar a la búsqueda de esta ciudad
+        await page.goto(cityUrl, {
+          waitUntil: "networkidle2",
+          timeout: CONFIG.TIMEOUT,
+        });
+
+        await this.humanSleep(2000, 3000);
+
+        // Verificar si hay bloqueo
+        const pageContent = await page.content().catch(() => "");
+        if (
+          pageContent.includes("unusual traffic") ||
+          pageContent.includes("captcha")
+        ) {
+          logger.warn(`⚠️ Bloqueo detectado en ${cityLabel}, esperando...`);
+          await this.sleep(10000);
+          continue;
+        }
+
+        // Esperar el panel de resultados
+        await page
+          .waitForSelector('div[role="feed"]', { timeout: 10000 })
+          .catch(() => {});
+
+        // Calcular cuántos resultados necesitamos de esta ciudad
+        const remainingNeeded = maxResults - allPlaces.length;
+        const perCityTarget =
+          Math.ceil(remainingNeeded / (gridSearch.urls.length - i)) + 5;
+
+        // Scroll y recolectar
+        const scrolledPlaces = await this.scrollAndCollect(page, perCityTarget);
+
+        logger.info(
+          `   ↳ Encontrados ${scrolledPlaces.length} lugares en ${cityLabel}`
+        );
+
+        // Obtener detalles de cada lugar
+        for (const placeUrl of scrolledPlaces) {
+          if (allPlaces.length >= maxResults) break;
+
+          // Extraer placeId para evitar duplicados
+          const placeIdMatch = placeUrl.match(/!1s([^!]+)/);
+          const placeId = placeIdMatch ? placeIdMatch[1] : placeUrl;
+
+          if (seenPlaceIds.has(placeId)) {
+            continue;
+          }
+          seenPlaceIds.add(placeId);
+
+          try {
+            const details = await this.getPlaceDetails(
+              page,
+              placeUrl,
+              allPlaces.length + 1,
+              maxResults
+            );
+
+            if (details) {
+              // Agregar la ciudad de origen
+              details.searchCity = cityLabel;
+              allPlaces.push(details);
+
+              scraperMetrics.recordPlaceFound({
+                phone: details.phone,
+                website: details.website,
+                socialMediaUrl: details.socialMediaUrl,
+                relevanceScore: details.relevanceScore,
+              });
+            }
+
+            await this.humanSleep(300, 600);
+          } catch (error: any) {
+            logger.warn(`⚠️ Error en lugar: ${error.message}`);
+          }
+        }
+
+        citiesSearched++;
+
+        // Delay entre ciudades
+        if (i < gridSearch.urls.length - 1 && allPlaces.length < maxResults) {
+          await this.humanSleep(2000, 4000);
+        }
+
+        // Si ya tenemos suficientes resultados, terminar
+        if (allPlaces.length >= maxResults) {
+          logger.info(`✅ Objetivo de ${maxResults} leads alcanzado`);
+          break;
+        }
+      } catch (error: any) {
+        logger.warn(`⚠️ Error en ciudad ${cityLabel}: ${error.message}`);
+      }
+    }
+
+    // Guardar en caché
+    if (allPlaces.length > 0) {
+      await cacheService.set(cacheKey, allPlaces, 86400);
+    }
+
+    const totalDuration = Date.now() - startTime;
+    logger.info(
+      `✅ Búsqueda provincial completada: ${
+        allPlaces.length
+      } lugares de ${citiesSearched} ciudades en ${(
+        totalDuration / 1000
+      ).toFixed(1)}s`
+    );
+
+    return allPlaces.slice(0, maxResults);
   }
 
   /**
@@ -721,44 +1384,223 @@ class GoogleMapsScraper {
     startTime: number,
     cacheKey: string
   ): Promise<ScrapedPlace[]> {
-    const { maxResults = 40 } = options;
+    const { maxResults = 100 } = options;
 
-    // Esperar el panel de resultados
-    await page
-      .waitForSelector('div[role="feed"]', { timeout: 10000 })
-      .catch(() => {
-        logger.warn("⚠️ No se encontró el panel de resultados");
-      });
+    try {
+      // Verificar si la página sigue abierta
+      if (page.isClosed()) {
+        logger.warn("⚠️ Página cerrada antes de iniciar scrapeSimple");
+        return places;
+      }
 
-    // Scroll para cargar más resultados
-    const scrolledPlaces = await this.scrollAndCollect(page, maxResults);
+      // Verificar si hay contenido de bloqueo
+      const pageContent = await page.content().catch(() => "");
+      if (
+        pageContent.includes("unusual traffic") ||
+        pageContent.includes("captcha")
+      ) {
+        logger.warn("⚠️ Google bloqueó la solicitud, esperando...");
+        await this.sleep(15000);
+        await page.reload({ waitUntil: "networkidle2" }).catch(() => {});
+        await this.sleep(3000);
+      }
 
-    logger.info(
-      `📍 Encontrados ${scrolledPlaces.length} lugares, obteniendo detalles...`
-    );
+      // Esperar un poco más para que cargue la página
+      await this.sleep(2000);
 
-    // Obtener detalles de cada lugar
-    for (let i = 0; i < Math.min(scrolledPlaces.length, maxResults); i++) {
+      // Intentar esperar el panel de resultados con varios intentos
+      let feedFound = false;
+      for (let attempt = 0; attempt < 3 && !feedFound; attempt++) {
+        try {
+          await page.waitForSelector('div[role="feed"]', { timeout: 8000 });
+          feedFound = true;
+          logger.info("✅ Panel de resultados encontrado");
+        } catch {
+          logger.warn(
+            `⚠️ Intento ${attempt + 1}/3: No se encontró el panel de resultados`
+          );
+          if (attempt < 2) {
+            await this.sleep(3000);
+            // Intentar hacer scroll para triggear la carga
+            await page.evaluate(() => window.scrollBy(0, 300)).catch(() => {});
+          }
+        }
+      }
+
+      if (!feedFound) {
+        logger.warn(
+          "⚠️ No se pudo encontrar el panel de resultados después de 3 intentos"
+        );
+        // Intentar obtener URLs directamente de la página
+        const directUrls = await page
+          .evaluate(() => {
+            const links = document.querySelectorAll('a[href*="/maps/place/"]');
+            return Array.from(links)
+              .map((l) => l.getAttribute("href"))
+              .filter(Boolean) as string[];
+          })
+          .catch(() => [] as string[]);
+
+        if (directUrls.length > 0) {
+          logger.info(
+            `📍 Encontrados ${directUrls.length} lugares sin panel de resultados`
+          );
+          // Continuar con estos URLs
+          return this.processPlaceUrls(
+            page,
+            directUrls.slice(0, maxResults),
+            places,
+            seenPlaceIds,
+            startTime,
+            cacheKey,
+            options
+          );
+        }
+        return places;
+      }
+
+      // Scroll para cargar más resultados
+      const scrolledPlaces = await this.scrollAndCollect(page, maxResults);
+
+      if (scrolledPlaces.length === 0) {
+        logger.warn("⚠️ No se encontraron lugares durante el scroll");
+        return places;
+      }
+
+      logger.info(
+        `📍 Encontrados ${scrolledPlaces.length} lugares, obteniendo detalles...`
+      );
+
+      // Obtener detalles de cada lugar
+      for (let i = 0; i < Math.min(scrolledPlaces.length, maxResults); i++) {
+        try {
+          // Verificar si la página sigue abierta
+          if (page.isClosed()) {
+            logger.warn("⚠️ Página cerrada durante obtención de detalles");
+            break;
+          }
+
+          const placeUrl = scrolledPlaces[i];
+          const requestStart = Date.now();
+
+          const details = await this.getPlaceDetails(
+            page,
+            placeUrl,
+            i + 1,
+            scrolledPlaces.length
+          );
+
+          const requestDuration = Date.now() - requestStart;
+
+          if (details) {
+            places.push(details);
+            scraperMetrics.recordRequest({
+              url: placeUrl,
+              success: true,
+              duration: requestDuration,
+            });
+            scraperMetrics.recordPlaceFound({
+              phone: details.phone,
+              website: details.website,
+              socialMediaUrl: details.socialMediaUrl,
+              relevanceScore: details.relevanceScore,
+            });
+          }
+
+          await this.humanSleep(300, 800);
+
+          if (antiDetection.shouldTakeLongPause()) {
+            logger.debug("☕ Tomando pausa larga (comportamiento humano)");
+            await this.sleep(antiDetection.getLongPauseDelay());
+          }
+        } catch (error: any) {
+          logger.warn(`⚠️ Error en lugar ${i + 1}: ${error.message}`);
+          scraperMetrics.recordRequest({
+            url: scrolledPlaces[i],
+            success: false,
+            duration: 0,
+            error: error.message,
+          });
+        }
+      }
+
+      // Guardar en caché
+      if (places.length > 0) {
+        await cacheService.set(cacheKey, places, 86400);
+        googleMapsCircuitBreaker.recordSuccess();
+      }
+
+      // Filtrar por relevancia si strictMatch
+      let filteredPlaces = places;
+      if (options.strictMatch) {
+        const minRelevance = 60;
+        filteredPlaces = places.filter((p) => p.relevanceScore >= minRelevance);
+
+        if (filteredPlaces.length < places.length) {
+          logger.info(
+            `🎯 Modo estricto: ${
+              places.length - filteredPlaces.length
+            } resultados filtrados`
+          );
+        }
+      }
+
+      const totalDuration = Date.now() - startTime;
+      logger.info(
+        `✅ Scraping simple completado: ${filteredPlaces.length} lugares en ${(
+          totalDuration / 1000
+        ).toFixed(1)}s`
+      );
+      scraperMetrics.logDetailedSummary();
+
+      return filteredPlaces;
+    } catch (error) {
+      // Manejo de error global para evitar crash del servidor
+      logger.error(
+        `❌ Error crítico en scrapeSimple: ${(error as Error).message}`
+      );
+
+      // Guardar lo que tengamos en caché
+      if (places.length > 0) {
+        await cacheService.set(cacheKey, places, 86400);
+      }
+
+      return places; // Devolver lo que hayamos conseguido
+    }
+  }
+
+  /**
+   * Procesar URLs de lugares directamente
+   */
+  private async processPlaceUrls(
+    page: Page,
+    urls: string[],
+    places: ScrapedPlace[],
+    seenPlaceIds: Set<string>,
+    startTime: number,
+    cacheKey: string,
+    options: ScrapeOptions
+  ): Promise<ScrapedPlace[]> {
+    logger.info(`📍 Procesando ${urls.length} lugares directamente...`);
+
+    for (let i = 0; i < urls.length; i++) {
       try {
-        const placeUrl = scrolledPlaces[i];
-        const requestStart = Date.now();
+        if (page.isClosed()) {
+          logger.warn("⚠️ Página cerrada durante procesamiento");
+          break;
+        }
 
+        const placeUrl = urls[i];
         const details = await this.getPlaceDetails(
           page,
           placeUrl,
           i + 1,
-          scrolledPlaces.length
+          urls.length
         );
 
-        const requestDuration = Date.now() - requestStart;
-
-        if (details) {
+        if (details && !seenPlaceIds.has(details.placeId)) {
+          seenPlaceIds.add(details.placeId);
           places.push(details);
-          scraperMetrics.recordRequest({
-            url: placeUrl,
-            success: true,
-            duration: requestDuration,
-          });
           scraperMetrics.recordPlaceFound({
             phone: details.phone,
             website: details.website,
@@ -768,19 +1610,8 @@ class GoogleMapsScraper {
         }
 
         await this.humanSleep(300, 800);
-
-        if (antiDetection.shouldTakeLongPause()) {
-          logger.debug("☕ Tomando pausa larga (comportamiento humano)");
-          await this.sleep(antiDetection.getLongPauseDelay());
-        }
-      } catch (error: any) {
-        logger.warn(`⚠️ Error en lugar ${i + 1}: ${error.message}`);
-        scraperMetrics.recordRequest({
-          url: scrolledPlaces[i],
-          success: false,
-          duration: 0,
-          error: error.message,
-        });
+      } catch (error) {
+        logger.warn(`⚠️ Error en lugar ${i + 1}: ${(error as Error).message}`);
       }
     }
 
@@ -790,30 +1621,14 @@ class GoogleMapsScraper {
       googleMapsCircuitBreaker.recordSuccess();
     }
 
-    // Filtrar por relevancia si strictMatch
-    let filteredPlaces = places;
-    if (options.strictMatch) {
-      const minRelevance = 60;
-      filteredPlaces = places.filter((p) => p.relevanceScore >= minRelevance);
-
-      if (filteredPlaces.length < places.length) {
-        logger.info(
-          `🎯 Modo estricto: ${
-            places.length - filteredPlaces.length
-          } resultados filtrados`
-        );
-      }
-    }
-
     const totalDuration = Date.now() - startTime;
     logger.info(
-      `✅ Scraping simple completado: ${filteredPlaces.length} lugares en ${(
+      `✅ Procesamiento directo completado: ${places.length} lugares en ${(
         totalDuration / 1000
       ).toFixed(1)}s`
     );
-    scraperMetrics.logDetailedSummary();
 
-    return filteredPlaces;
+    return places;
   }
 
   /**
@@ -853,6 +1668,198 @@ class GoogleMapsScraper {
   }
 
   /**
+   * 🗺️ Mover el mapa a coordenadas específicas y presionar "Buscar en esta área"
+   * Simula comportamiento humano de arrastrar el mapa
+   */
+  private async moveMapAndSearch(
+    page: Page,
+    targetLat: number,
+    targetLng: number,
+    keyword: string
+  ): Promise<boolean> {
+    try {
+      logger.debug(
+        `🗺️ Moviendo mapa a (${targetLat.toFixed(4)}, ${targetLng.toFixed(4)})`
+      );
+
+      // Método 1: Usar drag & drop en el mapa (más humano)
+      const mapContainer = await page.$('div[id="scene"]');
+      if (mapContainer) {
+        const box = await mapContainer.boundingBox();
+        if (box) {
+          // Calcular movimiento aleatorio pero significativo
+          const startX = box.x + box.width / 2;
+          const startY = box.y + box.height / 2;
+
+          // Mover en dirección aleatoria (simula arrastre humano)
+          const directions = [
+            { dx: -200, dy: 0, name: "oeste" },
+            { dx: 200, dy: 0, name: "este" },
+            { dx: 0, dy: -150, name: "norte" },
+            { dx: 0, dy: 150, name: "sur" },
+            { dx: -150, dy: -100, name: "noroeste" },
+            { dx: 150, dy: -100, name: "noreste" },
+            { dx: -150, dy: 100, name: "suroeste" },
+            { dx: 150, dy: 100, name: "sureste" },
+          ];
+
+          const randomDir =
+            directions[Math.floor(Math.random() * directions.length)];
+
+          // Simular arrastre humano con movimiento gradual
+          await page.mouse.move(startX, startY);
+          await this.humanSleep(100, 200);
+          await page.mouse.down();
+          await this.humanSleep(50, 100);
+
+          // Movimiento gradual (más humano)
+          const steps = 5;
+          for (let step = 1; step <= steps; step++) {
+            await page.mouse.move(
+              startX + (randomDir.dx * step) / steps,
+              startY + (randomDir.dy * step) / steps
+            );
+            await this.sleep(30 + Math.random() * 20);
+          }
+
+          await page.mouse.up();
+          logger.debug(`   ↳ Mapa arrastrado hacia ${randomDir.name}`);
+
+          await this.humanSleep(800, 1500);
+        }
+      }
+
+      // Método 2: Buscar y presionar el botón "Buscar en esta área"
+      const searchInAreaClicked = await this.clickSearchInArea(page);
+
+      if (searchInAreaClicked) {
+        // Esperar a que carguen los nuevos resultados
+        await this.humanSleep(2000, 3000);
+        await page
+          .waitForSelector('div[role="feed"]', { timeout: 10000 })
+          .catch(() => {});
+        return true;
+      }
+
+      // Si no encontramos el botón, hacer zoom in/out para forzar la aparición
+      await this.zoomMap(page, "out");
+      await this.humanSleep(500, 1000);
+      await this.zoomMap(page, "in");
+      await this.humanSleep(1000, 1500);
+
+      // Intentar de nuevo
+      return await this.clickSearchInArea(page);
+    } catch (error) {
+      logger.warn(`⚠️ Error moviendo mapa: ${(error as Error).message}`);
+      return false;
+    }
+  }
+
+  /**
+   * 🔍 Buscar y presionar el botón "Buscar en esta área"
+   */
+  private async clickSearchInArea(page: Page): Promise<boolean> {
+    try {
+      // Selectores posibles para el botón (puede variar según idioma/versión)
+      const buttonSelectors = [
+        'button[data-value="Buscar en esta área"]',
+        'button[aria-label*="Buscar en esta área"]',
+        'button[aria-label*="Search this area"]',
+        'button:has-text("Buscar en esta área")',
+        'button:has-text("Search this area")',
+        // Selector genérico por clase de Google
+        "button.hYBOP",
+        // El botón suele estar cerca del mapa
+        'div[role="main"] button[jsaction*="mouseover"]',
+      ];
+
+      for (const selector of buttonSelectors) {
+        try {
+          const button = await page.$(selector);
+          if (button) {
+            const isVisible = await button.isIntersectingViewport();
+            if (isVisible) {
+              await this.humanSleep(200, 400);
+              await button.click();
+              logger.info(`🔍 Botón "Buscar en esta área" presionado`);
+              return true;
+            }
+          }
+        } catch {
+          // Intentar siguiente selector
+        }
+      }
+
+      // Fallback: Buscar por texto en el contenido
+      const clicked = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll("button"));
+        for (const btn of buttons) {
+          const text = btn.textContent?.toLowerCase() || "";
+          const ariaLabel = btn.getAttribute("aria-label")?.toLowerCase() || "";
+
+          if (
+            text.includes("buscar en esta") ||
+            text.includes("search this area") ||
+            ariaLabel.includes("buscar en esta") ||
+            ariaLabel.includes("search this area")
+          ) {
+            (btn as HTMLButtonElement).click();
+            return true;
+          }
+        }
+        return false;
+      });
+
+      if (clicked) {
+        logger.info(`🔍 Botón "Buscar en esta área" presionado (fallback)`);
+        return true;
+      }
+
+      logger.debug(`   ↳ Botón "Buscar en esta área" no encontrado`);
+      return false;
+    } catch (error) {
+      logger.debug(`   ↳ Error buscando botón: ${(error as Error).message}`);
+      return false;
+    }
+  }
+
+  /**
+   * 🔍 Hacer zoom in/out en el mapa
+   */
+  private async zoomMap(page: Page, direction: "in" | "out"): Promise<void> {
+    try {
+      // Buscar botones de zoom
+      const zoomSelector =
+        direction === "in"
+          ? 'button[aria-label*="Acercar"], button[aria-label*="Zoom in"]'
+          : 'button[aria-label*="Alejar"], button[aria-label*="Zoom out"]';
+
+      const zoomButton = await page.$(zoomSelector);
+      if (zoomButton) {
+        await zoomButton.click();
+        logger.debug(
+          `   ↳ Zoom ${direction === "in" ? "acercado" : "alejado"}`
+        );
+      } else {
+        // Fallback: usar scroll del mouse sobre el mapa
+        const map = await page.$('div[id="scene"]');
+        if (map) {
+          const box = await map.boundingBox();
+          if (box) {
+            await page.mouse.move(
+              box.x + box.width / 2,
+              box.y + box.height / 2
+            );
+            await page.mouse.wheel({ deltaY: direction === "in" ? -100 : 100 });
+          }
+        }
+      }
+    } catch {
+      // Ignorar errores de zoom
+    }
+  }
+
+  /**
    * Hacer scroll y recolectar URLs de lugares
    */
   private async scrollAndCollect(
@@ -868,57 +1875,76 @@ class GoogleMapsScraper {
       `📜 Iniciando scroll para encontrar hasta ${maxResults} lugares...`
     );
 
-    while (
-      scrollAttempts < CONFIG.MAX_SCROLL_ATTEMPTS &&
-      placeUrls.size < maxResults
-    ) {
-      // Obtener URLs de lugares visibles
-      const urls = await page.evaluate(function () {
-        var links = document.querySelectorAll('a[href*="/maps/place/"]');
-        var result = [];
-        for (var i = 0; i < links.length; i++) {
-          var href = links[i].getAttribute("href");
-          if (href && href.includes("/maps/place/")) {
-            result.push(href);
-          }
-        }
-        return result;
-      });
-
-      urls.forEach((url) => placeUrls.add(url));
-
-      if (placeUrls.size === lastCount) {
-        noNewResultsCount++;
-        scrollAttempts++;
-
-        // Si después de 3 intentos sin nuevos resultados, probablemente llegamos al final
-        if (noNewResultsCount >= 3) {
-          logger.info(
-            `📜 Fin de resultados alcanzado después de ${scrollAttempts} scrolls (${placeUrls.size} lugares)`
-          );
+    try {
+      while (
+        scrollAttempts < CONFIG.MAX_SCROLL_ATTEMPTS &&
+        placeUrls.size < maxResults
+      ) {
+        // Verificar si la página sigue abierta
+        if (page.isClosed()) {
+          logger.warn("⚠️ Página cerrada durante scroll");
           break;
         }
-      } else {
-        noNewResultsCount = 0;
-        scrollAttempts = 0;
-        lastCount = placeUrls.size;
-      }
 
-      // Scroll en el panel de resultados con comportamiento humano
-      await page.evaluate(function () {
-        var feed = document.querySelector('div[role="feed"]');
-        if (feed) {
-          // Scroll variable para parecer más humano
-          var scrollAmount = 800 + Math.floor(Math.random() * 400);
-          feed.scrollTop = feed.scrollTop + scrollAmount;
+        // Obtener URLs de lugares visibles
+        const urls = await page
+          .evaluate(function () {
+            var links = document.querySelectorAll('a[href*="/maps/place/"]');
+            var result = [];
+            for (var i = 0; i < links.length; i++) {
+              var href = links[i].getAttribute("href");
+              if (href && href.includes("/maps/place/")) {
+                result.push(href);
+              }
+            }
+            return result;
+          })
+          .catch(() => [] as string[]);
+
+        urls.forEach((url) => placeUrls.add(url));
+
+        if (placeUrls.size === lastCount) {
+          noNewResultsCount++;
+          scrollAttempts++;
+
+          // 🆕 Aumentado a 5 intentos para dar más chance de cargar en conexiones lentas
+          if (noNewResultsCount >= 5) {
+            logger.info(
+              `📜 Fin de resultados alcanzado después de ${scrollAttempts} scrolls (${placeUrls.size} lugares)`
+            );
+            break;
+          }
+        } else {
+          noNewResultsCount = 0;
+          // 🆕 NO resetear scrollAttempts a 0, solo decrementar para ser más agresivo
+          if (scrollAttempts > 0) scrollAttempts--;
+          lastCount = placeUrls.size;
         }
-      });
 
-      // Delay humanizado entre scrolls
-      await this.humanSleep(800, 1500);
-      logger.debug(
-        `📜 Scroll ${scrollAttempts + 1}: ${placeUrls.size} lugares encontrados`
-      );
+        // Scroll en el panel de resultados con comportamiento humano
+        await page
+          .evaluate(function () {
+            var feed = document.querySelector('div[role="feed"]');
+            if (feed) {
+              // 🆕 Scroll más agresivo para cargar más resultados
+              var scrollAmount = 1000 + Math.floor(Math.random() * 500);
+              feed.scrollTop = feed.scrollTop + scrollAmount;
+            }
+          })
+          .catch(() => {
+            // Ignorar errores de scroll
+          });
+
+        // Delay humanizado entre scrolls
+        await this.humanSleep(800, 1500);
+        logger.debug(
+          `📜 Scroll ${scrollAttempts + 1}: ${
+            placeUrls.size
+          } lugares encontrados`
+        );
+      }
+    } catch (error) {
+      logger.warn(`⚠️ Error durante scroll: ${(error as Error).message}`);
     }
 
     logger.info(
@@ -992,14 +2018,49 @@ class GoogleMapsScraper {
           if (phoneAttr) phone = phoneAttr.replace("phone:tel:", "");
         }
 
-        // Website
+        // Website - múltiples selectores para mayor compatibilidad
+        var website = "";
+        // 1. Selector principal de autoridad
         var websiteButton = document.querySelector(
           'a[data-item-id="authority"]'
         );
-        var website = "";
         if (websiteButton) {
           var hrefAttr = websiteButton.getAttribute("href");
           if (hrefAttr) website = hrefAttr;
+        }
+        // 2. Fallback: buscar en botones con ícono de website
+        if (!website) {
+          var allLinks = document.querySelectorAll('a[href^="http"]');
+          for (var i = 0; i < allLinks.length; i++) {
+            var link = allLinks[i] as HTMLAnchorElement;
+            var href = link.href;
+            // Ignorar links de Google, redes sociales, etc
+            if (
+              href &&
+              !href.includes("google.com") &&
+              !href.includes("facebook.com") &&
+              !href.includes("instagram.com") &&
+              !href.includes("twitter.com") &&
+              !href.includes("youtube.com") &&
+              !href.includes("linkedin.com") &&
+              link.closest('div[role="region"]')
+            ) {
+              website = href;
+              break;
+            }
+          }
+        }
+        // 3. Fallback: buscar texto que parezca URL en la página
+        if (!website) {
+          var bodyText = document.body.innerText || "";
+          var urlMatch = bodyText.match(
+            /(?:www\.|https?:\/\/)[a-zA-Z0-9][-a-zA-Z0-9]+\.[a-zA-Z]{2,}(?:\/[^\s]*)?/i
+          );
+          if (urlMatch) {
+            website = urlMatch[0].startsWith("http")
+              ? urlMatch[0]
+              : "https://" + urlMatch[0];
+          }
         }
 
         // Rating
@@ -1066,7 +2127,10 @@ class GoogleMapsScraper {
 
       // Verificar si el website es una red social
       const isSocialMedia = this.isSocialMediaUrl(data.website || "");
-      const hasRealWebsite = !!data.website && !isSocialMedia;
+      // Verificar si es un directorio (Argenprop, ZonaProp, etc.)
+      const isDirectory = this.isDirectoryUrl(data.website || "");
+      // Solo es website REAL si no es red social NI directorio
+      const hasRealWebsite = this.isRealBusinessWebsite(data.website || "");
 
       // Extraer URLs específicas de redes sociales
       const socialUrls = this.extractSocialUrls(data.website || "");
@@ -1079,7 +2143,13 @@ class GoogleMapsScraper {
       );
 
       // Log mejorado con más info
-      const webStatus = hasRealWebsite ? "🌐" : isSocialMedia ? "📱" : "❌";
+      const webStatus = hasRealWebsite
+        ? "🌐"
+        : isSocialMedia
+        ? "📱"
+        : isDirectory
+        ? "📋"
+        : "❌";
       const phoneStatus = data.phone ? "📞" : "—";
       logger.info(
         `✨ ${data.name} | ⭐${

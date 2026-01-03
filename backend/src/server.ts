@@ -13,6 +13,7 @@ import { z } from "zod";
 import browserPool from "./services/browserPool";
 import cacheService from "./services/cacheService";
 import crmExportService from "./services/crmExportService";
+import leadEnrichmentService from "./services/leadEnrichmentService";
 import logger from "./services/logger";
 import placesService from "./services/placesService";
 import premiumAlertService from "./services/premiumAlertService";
@@ -64,7 +65,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 const searchSchema = z.object({
   keyword: z.string().min(1, "Keyword es requerido").max(100),
   location: z.string().min(1, "Location es requerido").max(100),
-  maxResults: z.number().min(1).max(100).optional().default(30),
+  maxResults: z.number().min(1).max(100).optional().default(100), // Default a 100 leads
   enrich: z.boolean().optional().default(true),
   minRating: z.number().min(0).max(5).optional(),
   requirePhone: z.boolean().optional(),
@@ -101,81 +102,10 @@ app.get("/health", async (req: Request, res: Response) => {
 });
 
 /**
- * 🚀 Iniciar scraping (versión normal - sin streaming)
- */
-app.post("/api/scrape", async (req: Request, res: Response) => {
-  try {
-    const validated = searchSchema.parse(req.body);
-
-    logger.info(
-      `🎯 Nueva búsqueda: "${validated.keyword}" en ${validated.location} (excludeExisting: ${validated.excludeExisting})`
-    );
-
-    const result = await placesService.searchPlaces(validated);
-
-    // Obtener los leads recién guardados desde la DB
-    const savedLeads = await prisma.lead.findMany({
-      where: {
-        searchKeyword: validated.keyword,
-        searchLocation: validated.location,
-      },
-      orderBy: { leadScore: "desc" },
-      take: validated.maxResults || 30,
-    });
-
-    // Recalcular scores si están en 0
-    const leadsWithScores = savedLeads.map((lead) => {
-      if (lead.leadScore === 0) {
-        return {
-          ...lead,
-          leadScore: calculateLeadScore(lead),
-        };
-      }
-      return lead;
-    });
-
-    res.json({
-      message: result.zoneInfo?.isLargeZone
-        ? `Búsqueda multi-zona: ${result.stats.newLeads} leads nuevos de ${result.zoneInfo.subzonesSearched} sub-zonas`
-        : `Se encontraron ${result.stats.newLeads} leads nuevos`,
-      success: true,
-      leads: leadsWithScores,
-      stats: {
-        found: result.stats.total,
-        newLeads: result.stats.newLeads,
-        existingLeads: result.stats.existingLeads,
-        duplicatePercentage: result.stats.duplicatePercentage,
-        saved: savedLeads.length,
-        duration: result.timing.total,
-        estimatedCost: 0,
-      },
-      zoneSaturation: result.zoneSaturation,
-      zoneInfo: result.zoneInfo,
-    });
-  } catch (error: unknown) {
-    const err = error as Error;
-    logger.error(`❌ Error en scraping: ${err.message}`);
-
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({
-        error: "Datos inválidos",
-        details: error.errors.map((e) => ({
-          field: e.path.join("."),
-          message: e.message,
-        })),
-      });
-    }
-
-    res.status(500).json({
-      error: "Error en el servidor",
-      message: err.message,
-    });
-  }
-});
-
-/**
- * 🔄 Scraping con streaming (Server-Sent Events)
+ * � Scraping con streaming (Server-Sent Events)
  * Los leads se envían en tiempo real conforme se encuentran
+ *
+ * NOTA: El endpoint POST /api/scrape fue removido - usar solo streaming
  */
 app.get("/api/scrape/stream", async (req: Request, res: Response) => {
   // Configurar SSE
@@ -194,10 +124,14 @@ app.get("/api/scrape/stream", async (req: Request, res: Response) => {
   try {
     const keyword = req.query.keyword as string;
     const location = req.query.location as string;
-    const maxResults = parseInt(req.query.maxResults as string) || 30;
+    const maxResults = parseInt(req.query.maxResults as string) || 100;
     const strictMatch = req.query.strictMatch === "true";
     const excludeExisting = req.query.excludeExisting !== "false"; // Por defecto true
     const forceRefresh = req.query.forceRefresh === "true"; // 🆕 Forzar re-scraping
+    // 🆕 Enrichment SIEMPRE activado - no queremos leads sin datos útiles
+    const deepEnrich = req.query.deepEnrich !== "false"; // Por defecto TRUE
+    // 🆕 Usar sinónimos para expandir búsqueda (ej: "dentista" busca también "odontólogo", "clínica dental")
+    const useSynonyms = req.query.useSynonyms === "true"; // Por defecto FALSE para mantener velocidad
 
     if (!keyword || !location) {
       sendEvent("error", { message: "keyword y location son requeridos" });
@@ -210,7 +144,9 @@ app.get("/api/scrape/stream", async (req: Request, res: Response) => {
         strictMatch ? " (modo estricto)" : ""
       }${excludeExisting ? "" : " (incluir existentes)"}${
         forceRefresh ? " (FORCE REFRESH)" : ""
-      }`
+      }${useSynonyms ? " (CON SINÓNIMOS)" : ""} (ENRICHMENT: ${
+        deepEnrich ? "ON" : "OFF"
+      })`
     );
     sendEvent("start", {
       keyword,
@@ -219,6 +155,8 @@ app.get("/api/scrape/stream", async (req: Request, res: Response) => {
       strictMatch,
       excludeExisting,
       forceRefresh,
+      deepEnrich,
+      useSynonyms,
     });
 
     // Importar y usar el scraper directamente para tener control granular
@@ -297,12 +235,17 @@ app.get("/api/scrape/stream", async (req: Request, res: Response) => {
         sendEvent("zone_start", { zone, index: i + 1, total: zones.length });
 
         try {
-          const places = await googleMapsScraper.scrapePlaces({
+          // 🆕 Usar scrapePlacesWithSynonyms si useSynonyms está activado
+          const scrapeMethod = useSynonyms
+            ? googleMapsScraper.scrapePlacesWithSynonyms.bind(googleMapsScraper)
+            : googleMapsScraper.scrapePlaces.bind(googleMapsScraper);
+
+          const places = await scrapeMethod({
             keyword,
             location: zone,
             maxResults: Math.ceil(maxResults / zones.length) + 5,
             strictMatch,
-            forceRefresh, // 🆕 Pasar forceRefresh al scraper
+            forceRefresh,
           });
 
           for (const place of places) {
@@ -327,7 +270,7 @@ app.get("/api/scrape/stream", async (req: Request, res: Response) => {
             if (place.reviewCount >= 50) leadScore += 10;
             if (place.phone) leadScore += 10;
 
-            // Guardar en DB
+            // Guardar en DB con campos de calidad y categorización
             const savedLead = await prisma.lead.upsert({
               where: { placeId: place.placeId },
               update: {},
@@ -351,6 +294,12 @@ app.get("/api/scrape/stream", async (req: Request, res: Response) => {
                   ? place.socialMediaUrl
                   : undefined,
                 leadScore,
+                // 🆕 Campos de calidad y categorización (vienen del scraper)
+                qualityScore: place.qualityScore,
+                qualityGrade: place.qualityGrade,
+                businessSize: place.businessSize,
+                businessType: place.businessType,
+                chainName: place.chainName,
                 searchKeyword: keyword,
                 searchLocation: location,
                 outreachStatus: "new",
@@ -359,8 +308,115 @@ app.get("/api/scrape/stream", async (req: Request, res: Response) => {
 
             newFound++;
             totalFound++;
+
+            // 🆕 Enriquecimiento profundo si está activado
+            let enrichedLead = savedLead;
+            if (deepEnrich) {
+              sendEvent("enriching", {
+                leadId: savedLead.id,
+                businessName: savedLead.businessName,
+              });
+
+              try {
+                const enrichmentData = await leadEnrichmentService.enrichLead(
+                  savedLead.businessName,
+                  location,
+                  {
+                    website: savedLead.websiteUrl || undefined,
+                    phone: savedLead.phoneRaw || undefined,
+                    instagramUrl: savedLead.instagramUrl || undefined,
+                    facebookUrl: savedLead.facebookUrl || undefined,
+                  },
+                  {
+                    searchGoogleForWebsite: !savedLead.hasWebsite,
+                    scrapeInstagram:
+                      !!savedLead.instagramUrl || !savedLead.hasWebsite,
+                    scrapeFacebook: !!savedLead.facebookUrl,
+                    scrapeWebsite: true,
+                    maxTimeMs: 10000, // ⚡ Reducido a 10 segundos
+                  }
+                );
+
+                // Actualizar lead con datos enriquecidos
+                enrichedLead = await prisma.lead.update({
+                  where: { id: savedLead.id },
+                  data: {
+                    // Email encontrado
+                    ...(enrichmentData.primaryEmail && {
+                      email: enrichmentData.primaryEmail,
+                      emailSource: enrichmentData.emailSource,
+                    }),
+                    // Todos los emails encontrados
+                    ...(enrichmentData.emails.length > 0 && {
+                      emails: enrichmentData.emails,
+                    }),
+                    // Website encontrado en Google/Instagram/Facebook
+                    ...(enrichmentData.websiteUrl &&
+                      !savedLead.websiteUrl && {
+                        websiteUrl: enrichmentData.websiteUrl,
+                        hasWebsite: enrichmentData.hasRealWebsite,
+                      }),
+                    // Teléfono si no tenía
+                    ...(enrichmentData.primaryPhone &&
+                      !savedLead.phoneRaw && {
+                        phoneRaw: enrichmentData.primaryPhone,
+                      }),
+                    // WhatsApp
+                    ...(enrichmentData.whatsappNumber && {
+                      phoneWhatsapp: enrichmentData.whatsappNumber,
+                    }),
+                    // Instagram datos
+                    ...(enrichmentData.instagramUrl &&
+                      !savedLead.instagramUrl && {
+                        instagramUrl: enrichmentData.instagramUrl,
+                      }),
+                    ...(enrichmentData.instagramHandle && {
+                      instagramHandle: enrichmentData.instagramHandle,
+                    }),
+                    ...(enrichmentData.instagramFollowers && {
+                      instagramFollowers: enrichmentData.instagramFollowers,
+                    }),
+                    ...(enrichmentData.instagramBio && {
+                      instagramBio: enrichmentData.instagramBio,
+                    }),
+                    // Facebook si no tenía
+                    ...(enrichmentData.facebookUrl &&
+                      !savedLead.facebookUrl && {
+                        facebookUrl: enrichmentData.facebookUrl,
+                      }),
+                    // Metadata de enriquecimiento
+                    enrichedAt: new Date(),
+                    enrichmentScore: enrichmentData.enrichmentScore,
+                    enrichmentSources: enrichmentData.enrichmentSources,
+                    // Recalcular leadScore con nuevos datos
+                    leadScore: calculateLeadScoreFromEnrichment(
+                      savedLead,
+                      enrichmentData
+                    ),
+                  },
+                });
+
+                sendEvent("enriched", {
+                  leadId: savedLead.id,
+                  emailFound: !!enrichmentData.primaryEmail,
+                  websiteFound:
+                    !!enrichmentData.websiteUrl && !savedLead.websiteUrl,
+                  phoneFound:
+                    !!enrichmentData.primaryPhone && !savedLead.phoneRaw,
+                  enrichmentScore: enrichmentData.enrichmentScore,
+                  sources: enrichmentData.enrichmentSources,
+                });
+              } catch (enrichError) {
+                logger.warn(
+                  `⚠️ Error enriqueciendo ${savedLead.businessName}: ${
+                    (enrichError as Error).message
+                  }`
+                );
+              }
+            }
+
             sendEvent("lead", {
-              lead: savedLead,
+              lead: enrichedLead,
               count: totalFound,
               maxResults: existingSent + targetNewResults,
               isNew: true, // 🆕 Marcar como nuevo
@@ -450,6 +506,11 @@ function calculateLeadScore(lead: any): number {
     score += 15;
   }
 
+  // Tiene email = Muy valioso (+20 puntos)
+  if (lead.email) {
+    score += 20;
+  }
+
   // Rating alto (>4.0) = Negocio establecido (+10 puntos)
   if (lead.googleRating && lead.googleRating >= 4.0) {
     score += 10;
@@ -464,6 +525,273 @@ function calculateLeadScore(lead: any): number {
 
   return Math.min(100, score);
 }
+
+/**
+ * 🆕 Calcular leadScore considerando datos de enriquecimiento
+ */
+function calculateLeadScoreFromEnrichment(lead: any, enrichment: any): number {
+  let score = 0;
+
+  // Website (considerar si se encontró uno nuevo)
+  const hasWebsite = lead.hasWebsite || enrichment.hasRealWebsite;
+  if (!hasWebsite) {
+    score += 35; // Sin web = máxima oportunidad
+  }
+
+  // Redes sociales
+  const hasIG = lead.instagramUrl || enrichment.instagramUrl;
+  const hasFB = lead.facebookUrl || enrichment.facebookUrl;
+  if ((hasIG || hasFB) && !hasWebsite) {
+    score += 20;
+  }
+
+  // Teléfono
+  if (lead.phoneRaw || enrichment.primaryPhone) {
+    score += 15;
+  }
+
+  // Email (muy valioso para contacto)
+  if (enrichment.primaryEmail) {
+    score += 20;
+  }
+
+  // Rating
+  if (lead.googleRating && lead.googleRating >= 4.0) {
+    score += 10;
+  }
+
+  // Reviews
+  if (lead.reviewCount >= 50) {
+    score += 10;
+  } else if (lead.reviewCount >= 20) {
+    score += 5;
+  }
+
+  // Bonus por múltiples fuentes de enriquecimiento
+  if (enrichment.enrichmentSources?.length >= 3) {
+    score += 5;
+  }
+
+  return Math.min(100, score);
+}
+
+/**
+ * 🔍 Enriquecer un lead existente
+ */
+app.post("/api/leads/:id/enrich", async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+
+    const lead = await prisma.lead.findUnique({ where: { id } });
+    if (!lead) {
+      return res.status(404).json({ error: "Lead no encontrado" });
+    }
+
+    logger.info(`🔍 Enriqueciendo lead: ${lead.businessName}`);
+
+    const enrichmentData = await leadEnrichmentService.enrichLead(
+      lead.businessName,
+      lead.searchLocation || lead.address || "",
+      {
+        website: lead.websiteUrl || undefined,
+        phone: lead.phoneRaw || undefined,
+        instagramUrl: lead.instagramUrl || undefined,
+        facebookUrl: lead.facebookUrl || undefined,
+      },
+      {
+        searchGoogleForWebsite: !lead.hasWebsite,
+        scrapeInstagram: true,
+        scrapeFacebook: true,
+        scrapeWebsite: true,
+        maxTimeMs: 30000,
+      }
+    );
+
+    // Actualizar lead con datos enriquecidos
+    const updatedLead = await prisma.lead.update({
+      where: { id },
+      data: {
+        // Email encontrado
+        ...(enrichmentData.primaryEmail && {
+          email: enrichmentData.primaryEmail,
+          emailSource: enrichmentData.emailSource,
+        }),
+        // Todos los emails
+        ...(enrichmentData.emails.length > 0 && {
+          emails: enrichmentData.emails,
+        }),
+        // Website encontrado
+        ...(enrichmentData.websiteUrl &&
+          !lead.websiteUrl && {
+            websiteUrl: enrichmentData.websiteUrl,
+            hasWebsite: enrichmentData.hasRealWebsite,
+          }),
+        // Teléfono si no tenía
+        ...(enrichmentData.primaryPhone &&
+          !lead.phoneRaw && {
+            phoneRaw: enrichmentData.primaryPhone,
+          }),
+        // WhatsApp
+        ...(enrichmentData.whatsappNumber && {
+          phoneWhatsapp: enrichmentData.whatsappNumber,
+        }),
+        // Instagram datos completos
+        ...(enrichmentData.instagramUrl &&
+          !lead.instagramUrl && {
+            instagramUrl: enrichmentData.instagramUrl,
+          }),
+        ...(enrichmentData.instagramHandle && {
+          instagramHandle: enrichmentData.instagramHandle,
+        }),
+        ...(enrichmentData.instagramFollowers && {
+          instagramFollowers: enrichmentData.instagramFollowers,
+        }),
+        ...(enrichmentData.instagramBio && {
+          instagramBio: enrichmentData.instagramBio,
+        }),
+        // Facebook si no tenía
+        ...(enrichmentData.facebookUrl &&
+          !lead.facebookUrl && {
+            facebookUrl: enrichmentData.facebookUrl,
+          }),
+        // Metadata de enriquecimiento
+        enrichedAt: new Date(),
+        enrichmentScore: enrichmentData.enrichmentScore,
+        enrichmentSources: enrichmentData.enrichmentSources,
+        // Recalcular leadScore
+        leadScore: calculateLeadScoreFromEnrichment(lead, enrichmentData),
+      },
+    });
+
+    res.json({
+      success: true,
+      lead: updatedLead,
+      enrichment: {
+        emailFound: enrichmentData.primaryEmail,
+        emailSource: enrichmentData.emailSource,
+        allEmails: enrichmentData.emails,
+        websiteFound: enrichmentData.websiteUrl,
+        websiteSource: enrichmentData.websiteSource,
+        phonesFound: enrichmentData.phones,
+        instagramData: {
+          url: enrichmentData.instagramUrl,
+          handle: enrichmentData.instagramHandle,
+          followers: enrichmentData.instagramFollowers,
+          bio: enrichmentData.instagramBio,
+        },
+        enrichmentScore: enrichmentData.enrichmentScore,
+        sources: enrichmentData.enrichmentSources,
+      },
+    });
+  } catch (error) {
+    logger.error(`❌ Error enriqueciendo lead: ${(error as Error).message}`);
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+/**
+ * 🔍 Enriquecer múltiples leads
+ */
+app.post("/api/leads/enrich-batch", async (req: Request, res: Response) => {
+  try {
+    const { leadIds, options } = req.body;
+
+    if (!Array.isArray(leadIds) || leadIds.length === 0) {
+      return res
+        .status(400)
+        .json({ error: "leadIds debe ser un array no vacío" });
+    }
+
+    if (leadIds.length > 20) {
+      return res.status(400).json({ error: "Máximo 20 leads por lote" });
+    }
+
+    const leads = await prisma.lead.findMany({
+      where: { id: { in: leadIds } },
+    });
+
+    logger.info(`🔍 Enriqueciendo ${leads.length} leads en lote...`);
+
+    const results = [];
+    for (const lead of leads) {
+      try {
+        const enrichmentData = await leadEnrichmentService.enrichLead(
+          lead.businessName,
+          lead.searchLocation || lead.address || "",
+          {
+            website: lead.websiteUrl || undefined,
+            phone: lead.phoneRaw || undefined,
+            instagramUrl: lead.instagramUrl || undefined,
+            facebookUrl: lead.facebookUrl || undefined,
+          },
+          {
+            searchGoogleForWebsite: !lead.hasWebsite,
+            scrapeInstagram: true,
+            scrapeFacebook: true,
+            scrapeWebsite: true,
+            maxTimeMs: 20000,
+            ...options,
+          }
+        );
+
+        // Actualizar en DB
+        const updated = await prisma.lead.update({
+          where: { id: lead.id },
+          data: {
+            ...(enrichmentData.primaryEmail && {
+              email: enrichmentData.primaryEmail,
+            }),
+            ...(enrichmentData.websiteUrl &&
+              !lead.websiteUrl && {
+                websiteUrl: enrichmentData.websiteUrl,
+                hasWebsite: enrichmentData.hasRealWebsite,
+              }),
+            ...(enrichmentData.primaryPhone &&
+              !lead.phoneRaw && {
+                phoneRaw: enrichmentData.primaryPhone,
+              }),
+            ...(enrichmentData.instagramUrl &&
+              !lead.instagramUrl && {
+                instagramUrl: enrichmentData.instagramUrl,
+              }),
+            ...(enrichmentData.facebookUrl &&
+              !lead.facebookUrl && {
+                facebookUrl: enrichmentData.facebookUrl,
+              }),
+            leadScore: calculateLeadScoreFromEnrichment(lead, enrichmentData),
+          },
+        });
+
+        results.push({
+          id: lead.id,
+          success: true,
+          emailFound: !!enrichmentData.primaryEmail,
+          websiteFound: !!enrichmentData.websiteUrl,
+          enrichmentScore: enrichmentData.enrichmentScore,
+        });
+      } catch (error) {
+        results.push({
+          id: lead.id,
+          success: false,
+          error: (error as Error).message,
+        });
+      }
+    }
+
+    // Cerrar navegador al terminar el batch
+    await leadEnrichmentService.close();
+
+    res.json({
+      success: true,
+      processed: results.length,
+      enriched: results.filter((r) => r.success).length,
+      results,
+    });
+  } catch (error) {
+    logger.error(`❌ Error en enrich-batch: ${(error as Error).message}`);
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
 
 /**
  * 📋 Obtener leads con paginación y ordenamiento

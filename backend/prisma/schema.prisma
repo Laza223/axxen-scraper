@@ -24,7 +24,9 @@ model Lead {
   // Contact
   phoneRaw      String?
   phoneWhatsapp String?
-  emails        String[] // Emails encontrados en el sitio
+  email         String? // Email principal para contacto
+  emails        String[] // Todos los emails encontrados
+  emailSource   String?  // Dónde se encontró el email (website, instagram, facebook, google)
   
   // Google Data
   googleRating   Float?
@@ -49,17 +51,32 @@ model Lead {
   // Social Media
   facebookUrl   String?
   instagramUrl  String?
+  instagramHandle   String?   // @usuario de Instagram
+  instagramFollowers Int?     // Número de seguidores
+  instagramBio      String?   // Bio de Instagram
   linkedinUrl   String?
   twitterUrl    String?
   youtubeUrl    String?
   tiktokUrl     String?
 
+  // Enrichment Metadata
+  enrichedAt       DateTime?
+  enrichmentScore  Int?      // 0-100, qué tan completo está el lead
+  enrichmentSources String[] // Fuentes usadas para enriquecer (google, instagram, facebook, website)
+
   // Scoring & Analysis
   leadScore        Int      @default(0) // 0-100
+  qualityScore     Int?     // 0-100 calculado por leadQualityScoringService
+  qualityGrade     String?  // A, B, C, D, F
   estimatedRevenue String   @default("Medium") // Low/Medium/High
   painPoints       String[]
   opportunities    String[] // Oportunidades de venta
   techStack        String?  // Stack tecnológico detectado
+
+  // Business Categorization
+  businessSize     String?  // franchise, chain, local, independent
+  businessType     String?  // Tipo de negocio detectado
+  chainName        String?  // Nombre de franquicia/cadena si aplica
 
   // Competition Analysis
   nearbyCompetitors    Int @default(0)

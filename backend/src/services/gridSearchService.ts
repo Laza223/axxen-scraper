@@ -45,19 +45,24 @@ export interface GridSearchResult {
   estimatedMinutes: number;
 }
 
-// Tamaños de ciudad aproximados para determinar el grid
+// Tamaños de área para determinar el grid
+// Actualizado con soporte para PROVINCIAS y regiones extensas
 const CITY_SIZE_ESTIMATES: Record<
   string,
   { radiusKm: number; gridSize: number }
 > = {
-  // Grandes ciudades
-  large: { radiusKm: 15, gridSize: 4 }, // 16 celdas
-  // Ciudades medianas
-  medium: { radiusKm: 8, gridSize: 3 }, // 9 celdas
+  // 🆕 PROVINCIAS completas (Buenos Aires, Córdoba, Santa Fe, etc.)
+  province: { radiusKm: 150, gridSize: 8 }, // 64 celdas - cobertura provincial amplia
+  // 🆕 Regiones/zonas grandes (Zona Norte GBA, Costa Atlántica, etc.)
+  region: { radiusKm: 60, gridSize: 6 }, // 36 celdas - cobertura regional
+  // Grandes ciudades (CABA, Córdoba Capital, Rosario, etc.)
+  large: { radiusKm: 25, gridSize: 5 }, // 25 celdas - muy exhaustivo
+  // Ciudades medianas (Pilar, Moreno, La Plata, etc.)
+  medium: { radiusKm: 12, gridSize: 4 }, // 16 celdas - buena cobertura
   // Ciudades pequeñas / localidades
-  small: { radiusKm: 4, gridSize: 2 }, // 4 celdas
-  // Muy pequeñas / barrios
-  tiny: { radiusKm: 2, gridSize: 1 }, // 1 celda (búsqueda directa)
+  small: { radiusKm: 6, gridSize: 3 }, // 9 celdas
+  // Muy pequeñas / barrios específicos
+  tiny: { radiusKm: 3, gridSize: 2 }, // 4 celdas
 };
 
 /**
@@ -152,15 +157,19 @@ export function createGrid(bbox: BoundingBox, gridSize: number): GridCell[] {
 
 /**
  * Calcula el nivel de zoom apropiado basado en la distancia
+ * 🆕 Actualizado para soportar celdas más grandes de búsquedas provinciales
  */
 function calculateZoomFromDistance(distanceKm: number): number {
   // Aproximación: zoom 14 ≈ 5km, cada nivel de zoom duplica/reduce la escala
   if (distanceKm <= 1) return 16;
   if (distanceKm <= 2) return 15;
-  if (distanceKm <= 4) return 14;
-  if (distanceKm <= 8) return 13;
-  if (distanceKm <= 15) return 12;
-  return 11;
+  if (distanceKm <= 5) return 14;
+  if (distanceKm <= 10) return 13;
+  if (distanceKm <= 20) return 12;
+  if (distanceKm <= 40) return 11;
+  if (distanceKm <= 80) return 10; // 🆕 Para celdas de regiones
+  if (distanceKm <= 150) return 9; // 🆕 Para celdas de provincias
+  return 8; // 🆕 Para áreas muy extensas
 }
 
 /**
@@ -175,44 +184,249 @@ export function buildGridSearchUrl(keyword: string, cell: GridCell): string {
 }
 
 /**
- * Estima el tamaño de una ciudad basado en su nombre
- * (heurística simple, se puede mejorar)
+ * Estima el tamaño de una ubicación basado en su nombre
+ * Mejorado para reconocer PROVINCIAS, regiones y localidades argentinas
  */
 export function estimateCitySize(
   location: string
-): "large" | "medium" | "small" | "tiny" {
-  const normalized = location.toLowerCase();
+): "province" | "region" | "large" | "medium" | "small" | "tiny" {
+  const normalized = location
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
 
-  // Palabras clave que indican tamaño
+  // 🆕 PROVINCIAS ARGENTINAS (áreas muy extensas)
+  const provinceIndicators = [
+    // Provincias completas (sin "capital")
+    "provincia de buenos aires",
+    "provincia de cordoba",
+    "provincia de santa fe",
+    "provincia de mendoza",
+    "provincia de tucuman",
+    "provincia de salta",
+    "provincia de entre rios",
+    "provincia de misiones",
+    "provincia de chaco",
+    "provincia de corrientes",
+    "provincia de santiago del estero",
+    "provincia de san juan",
+    "provincia de jujuy",
+    "provincia de rio negro",
+    "provincia de neuquen",
+    "provincia de formosa",
+    "provincia de chubut",
+    "provincia de san luis",
+    "provincia de catamarca",
+    "provincia de la rioja",
+    "provincia de la pampa",
+    "provincia de santa cruz",
+    "provincia de tierra del fuego",
+    // Variantes sin "provincia de"
+    "buenos aires provincia",
+    "gba completo",
+    "gran buenos aires",
+  ];
+
+  // 🆕 Detectar si es solo el nombre de una provincia (sin ciudad específica)
+  const onlyProvinceNames = [
+    // Si dice SOLO "buenos aires" sin especificar ciudad, es la provincia
+    // Pero debemos verificar que no tenga indicadores de ciudad
+  ];
+
+  // 🆕 REGIONES / ZONAS extensas
+  const regionIndicators = [
+    "zona norte",
+    "zona sur",
+    "zona oeste",
+    "zona este",
+    "conurbano",
+    "conurbano bonaerense",
+    "costa atlantica",
+    "interior de",
+    "region pampeana",
+    "region patagonica",
+    "region cuyo",
+    "region noa",
+    "region nea",
+    "litoral argentino",
+    "noroeste argentino",
+    "noreste argentino",
+    // Partidos grandes que son casi regiones
+    "la matanza completo",
+    "todo pilar",
+    "todo escobar",
+  ];
+
+  // Ciudades GRANDES (capitales, ciudades principales)
   const largeIndicators = [
-    "capital",
-    "ciudad de",
-    "cdmx",
-    "buenos aires",
-    "santiago",
-    "lima",
-    "bogotá",
-    "madrid",
-    "barcelona",
-  ];
-  const tinyIndicators = [
-    "barrio",
-    "colonia",
-    "urbanización",
-    "fraccionamiento",
-    "villa",
+    "capital federal",
+    "caba",
+    "ciudad autonoma",
+    "buenos aires ciudad",
+    "cordoba capital",
+    "ciudad de cordoba",
+    "rosario",
+    "mendoza capital",
+    "ciudad de mendoza",
+    "tucuman capital",
+    "san miguel de tucuman",
+    "la plata",
+    "mar del plata",
+    "salta capital",
+    "ciudad de salta",
+    "santa fe capital",
+    "ciudad de santa fe",
+    "san salvador de jujuy",
+    "neuquen capital",
+    "ciudad de neuquen",
+    "resistencia",
+    "corrientes capital",
+    "posadas",
+    "san juan capital",
+    "ciudad de san juan",
   ];
 
+  // Partidos/ciudades MEDIANAS del conurbano y otras
+  const mediumIndicators = [
+    // Zona Norte
+    "pilar",
+    "tigre",
+    "san isidro",
+    "vicente lopez",
+    "san fernando",
+    "escobar",
+    "campana",
+    "zarate",
+    "exaltacion de la cruz",
+    // Zona Oeste
+    "moreno",
+    "merlo",
+    "moron",
+    "hurlingham",
+    "ituzaingo",
+    "la matanza",
+    "tres de febrero",
+    "san miguel",
+    "jose c paz",
+    "jose c. paz",
+    "malvinas argentinas",
+    "general rodriguez",
+    "lujan",
+    "marcos paz",
+    // Zona Sur
+    "quilmes",
+    "lanus",
+    "avellaneda",
+    "lomas de zamora",
+    "almirante brown",
+    "berazategui",
+    "florencio varela",
+    "esteban echeverria",
+    "ezeiza",
+    "presidente peron",
+    "san vicente",
+    // Otras ciudades medianas
+    "bahia blanca",
+    "rio cuarto",
+    "villa maria",
+    "san nicolas",
+    "pergamino",
+    "tandil",
+    "olavarria",
+    "junin",
+    "san rafael",
+    "comodoro rivadavia",
+    "rawson",
+    "trelew",
+    "ushuaia",
+    "rio gallegos",
+    "santa rosa",
+    "general pico",
+    "formosa capital",
+    "san luis capital",
+  ];
+
+  // Localidades PEQUEÑAS / barrios específicos
+  const smallIndicators = [
+    "barrio",
+    "localidad de",
+    "villa",
+    "country",
+    "club de campo",
+  ];
+
+  // Verificar tamaño en orden (de mayor a menor)
+
+  // 🆕 Primero verificar si es una PROVINCIA
+  if (provinceIndicators.some((ind) => normalized.includes(ind))) {
+    return "province";
+  }
+
+  // 🆕 Verificar REGIONES
+  if (regionIndicators.some((ind) => normalized.includes(ind))) {
+    return "region";
+  }
+
+  // Verificar si es una ciudad grande
   if (largeIndicators.some((ind) => normalized.includes(ind))) {
     return "large";
   }
 
-  if (tinyIndicators.some((ind) => normalized.includes(ind))) {
+  // Verificar ciudades medianas
+  if (mediumIndicators.some((ind) => normalized.includes(ind))) {
+    return "medium";
+  }
+
+  // Verificar localidades pequeñas
+  if (smallIndicators.some((ind) => normalized.includes(ind))) {
     return "tiny";
   }
 
-  // Por defecto, asumir ciudad mediana/pequeña
-  // Ciudades como "Luján", "Pilar", etc.
+  // 🆕 HEURÍSTICA: Si contiene "provincia" en cualquier parte, tratarlo como provincia
+  if (normalized.includes("provincia")) {
+    return "province";
+  }
+
+  // 🆕 HEURÍSTICA: Si es SOLO el nombre de una provincia conocida (sin ciudad)
+  const pureProvinceNames = [
+    "buenos aires",
+    "cordoba",
+    "santa fe",
+    "mendoza",
+    "tucuman",
+    "salta",
+    "entre rios",
+    "misiones",
+    "chaco",
+    "corrientes",
+    "santiago del estero",
+    "san juan",
+    "jujuy",
+    "rio negro",
+    "neuquen",
+    "formosa",
+    "chubut",
+    "san luis",
+    "catamarca",
+    "la rioja",
+    "la pampa",
+    "santa cruz",
+    "tierra del fuego",
+  ];
+
+  // Si el texto normalizado es EXACTAMENTE una provincia (o muy similar)
+  for (const prov of pureProvinceNames) {
+    // Si es exacto o termina con ", argentina" o "argentina"
+    if (
+      normalized === prov ||
+      normalized === `${prov} argentina` ||
+      normalized === `${prov}, argentina`
+    ) {
+      return "province";
+    }
+  }
+
+  // Por defecto, asumir ciudad pequeña (cubrir bien sin excederse)
   return "small";
 }
 
@@ -262,20 +476,35 @@ class GridSearchService {
     const autoConfig = generateGridConfig(location);
     const gridSize = options?.gridSize ?? autoConfig.gridSize;
     const radiusKm = options?.radiusKm ?? autoConfig.radiusKm;
-    const maxCells = options?.maxCells ?? 16;
+    const maxCells = options?.maxCells ?? 64; // 🆕 Aumentado para provincias
 
     logger.info(
       `🗺️ Preparando grid search para "${location}": ${gridSize}x${gridSize} grid, radio ${radiusKm}km`
     );
 
-    // Por ahora generamos las celdas sin coordenadas exactas
-    // Las coordenadas se obtendrán dinámicamente al navegar
-    // Generamos búsquedas con diferentes "perspectivas" de la ubicación
-    const searchVariations = this.generateSearchVariations(
-      keyword,
-      location,
-      Math.min(gridSize * gridSize, maxCells)
-    );
+    // 🆕 Para provincias, usar búsqueda por ciudades principales
+    const citySize = estimateCitySize(location);
+    let searchVariations;
+
+    if (citySize === "province" || citySize === "region") {
+      searchVariations = this.generateProvincialSearchVariations(
+        keyword,
+        location,
+        maxCells
+      );
+      logger.info(
+        `🗺️ Modo provincial/regional: ${searchVariations.length} ciudades a buscar`
+      );
+    } else {
+      // Por ahora generamos las celdas sin coordenadas exactas
+      // Las coordenadas se obtendrán dinámicamente al navegar
+      // Generamos búsquedas con diferentes "perspectivas" de la ubicación
+      searchVariations = this.generateSearchVariations(
+        keyword,
+        location,
+        Math.min(gridSize * gridSize, maxCells)
+      );
+    }
 
     return {
       urls: searchVariations.map((v) => v.url),
@@ -287,6 +516,268 @@ class GridSearchService {
       center: null, // Se obtendrá después de la primera navegación
       config: { gridSize, radiusKm },
     };
+  }
+
+  /**
+   * 🆕 Genera variaciones de búsqueda para PROVINCIAS
+   * Busca en las ciudades principales de la provincia
+   */
+  private generateProvincialSearchVariations(
+    keyword: string,
+    location: string,
+    maxCities: number
+  ): Array<{ url: string; label: string; variation: string }> {
+    const variations: Array<{ url: string; label: string; variation: string }> =
+      [];
+    const normalized = location
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+
+    // Mapeo de provincias a sus ciudades principales
+    const provinceCities: Record<string, string[]> = {
+      "buenos aires": [
+        "La Plata",
+        "Mar del Plata",
+        "Bahía Blanca",
+        "Tandil",
+        "San Nicolás",
+        "Pergamino",
+        "Junín",
+        "Olavarría",
+        "Necochea",
+        "Luján",
+        "Zárate",
+        "Campana",
+        "San Pedro",
+        "Chivilcoy",
+        "Mercedes",
+        "Azul",
+        "Trenque Lauquen",
+        "9 de Julio",
+        "Dolores",
+        "Chascomús",
+        "Pilar",
+        "Tigre",
+        "San Isidro",
+        "Quilmes",
+        "Moreno",
+        "La Matanza",
+        "Lomas de Zamora",
+        "Lanús",
+        "Avellaneda",
+        "Florencio Varela",
+      ],
+      cordoba: [
+        "Córdoba Capital",
+        "Villa María",
+        "Río Cuarto",
+        "San Francisco",
+        "Villa Carlos Paz",
+        "Alta Gracia",
+        "Jesús María",
+        "Cosquín",
+        "La Falda",
+        "Bell Ville",
+        "Villa Dolores",
+        "Río Tercero",
+        "Marcos Juárez",
+        "Cruz del Eje",
+        "Dean Funes",
+      ],
+      "santa fe": [
+        "Rosario",
+        "Santa Fe Capital",
+        "Rafaela",
+        "Venado Tuerto",
+        "Reconquista",
+        "Villa Constitución",
+        "Casilda",
+        "Esperanza",
+        "San Lorenzo",
+        "Cañada de Gómez",
+        "Sunchales",
+        "Rufino",
+        "Villa Gobernador Gálvez",
+        "Firmat",
+        "Santo Tomé",
+      ],
+      mendoza: [
+        "Mendoza Capital",
+        "San Rafael",
+        "Godoy Cruz",
+        "Guaymallén",
+        "Las Heras",
+        "Maipú",
+        "Luján de Cuyo",
+        "Tunuyán",
+        "San Martín",
+        "Rivadavia",
+      ],
+      tucuman: [
+        "San Miguel de Tucumán",
+        "Concepción",
+        "Yerba Buena",
+        "Banda del Río Salí",
+        "Tafí Viejo",
+        "Famaillá",
+        "Monteros",
+        "Aguilares",
+        "Lules",
+      ],
+      salta: [
+        "Salta Capital",
+        "San Ramón de la Nueva Orán",
+        "Tartagal",
+        "Metán",
+        "General Güemes",
+        "Cafayate",
+        "Rosario de la Frontera",
+      ],
+      "entre rios": [
+        "Paraná",
+        "Concordia",
+        "Gualeguaychú",
+        "Concepción del Uruguay",
+        "Villaguay",
+        "Federación",
+        "Victoria",
+        "Colón",
+        "Chajarí",
+      ],
+      misiones: [
+        "Posadas",
+        "Oberá",
+        "Eldorado",
+        "Puerto Iguazú",
+        "Apóstoles",
+        "San Vicente",
+        "Jardín América",
+        "Leandro N. Alem",
+      ],
+      chaco: [
+        "Resistencia",
+        "Presidencia Roque Sáenz Peña",
+        "Villa Ángela",
+        "General San Martín",
+        "Charata",
+        "Las Breñas",
+      ],
+      corrientes: [
+        "Corrientes Capital",
+        "Goya",
+        "Paso de los Libres",
+        "Mercedes",
+        "Curuzú Cuatiá",
+        "Bella Vista",
+        "Monte Caseros",
+      ],
+      neuquen: [
+        "Neuquén Capital",
+        "San Martín de los Andes",
+        "Cutral Co",
+        "Zapala",
+        "Centenario",
+        "Plottier",
+        "Villa La Angostura",
+      ],
+      "rio negro": [
+        "Viedma",
+        "San Carlos de Bariloche",
+        "General Roca",
+        "Cipolletti",
+        "Allen",
+        "Villa Regina",
+        "El Bolsón",
+      ],
+      chubut: [
+        "Rawson",
+        "Comodoro Rivadavia",
+        "Trelew",
+        "Puerto Madryn",
+        "Esquel",
+        "Sarmiento",
+      ],
+      jujuy: [
+        "San Salvador de Jujuy",
+        "San Pedro de Jujuy",
+        "Libertador General San Martín",
+        "Palpalá",
+        "Humahuaca",
+        "Tilcara",
+      ],
+      "san juan": [
+        "San Juan Capital",
+        "Rawson",
+        "Rivadavia",
+        "Chimbas",
+        "Santa Lucía",
+        "Pocito",
+        "Caucete",
+      ],
+      "san luis": [
+        "San Luis Capital",
+        "Villa Mercedes",
+        "Merlo",
+        "La Punta",
+        "Juana Koslay",
+      ],
+      catamarca: [
+        "San Fernando del Valle de Catamarca",
+        "Tinogasta",
+        "Andalgalá",
+        "Santa María",
+      ],
+      "la rioja": ["La Rioja Capital", "Chilecito", "Aimogasta"],
+      formosa: ["Formosa Capital", "Clorinda", "Pirané", "El Colorado"],
+      "la pampa": ["Santa Rosa", "General Pico", "Toay", "Realicó"],
+      "santa cruz": [
+        "Río Gallegos",
+        "Caleta Olivia",
+        "El Calafate",
+        "Pico Truncado",
+        "Puerto Deseado",
+      ],
+      "tierra del fuego": ["Ushuaia", "Río Grande", "Tolhuin"],
+      "santiago del estero": [
+        "Santiago del Estero Capital",
+        "La Banda",
+        "Termas de Río Hondo",
+        "Añatuya",
+        "Frías",
+      ],
+    };
+
+    // Detectar qué provincia es
+    let cities: string[] = [];
+    for (const [prov, provCities] of Object.entries(provinceCities)) {
+      if (normalized.includes(prov)) {
+        cities = provCities;
+        break;
+      }
+    }
+
+    // Si no encontramos ciudades específicas, usar una estrategia genérica
+    if (cities.length === 0) {
+      // Usar variaciones con puntos cardinales y términos genéricos
+      return this.generateSearchVariations(keyword, location, maxCities);
+    }
+
+    // Limitar a maxCities ciudades
+    const citiesToSearch = cities.slice(0, maxCities);
+
+    // Generar URLs para cada ciudad
+    for (const city of citiesToSearch) {
+      variations.push({
+        url: `https://www.google.com/maps/search/${encodeURIComponent(
+          `${keyword} en ${city}`
+        )}`,
+        label: city,
+        variation: city,
+      });
+    }
+
+    return variations;
   }
 
   /**
